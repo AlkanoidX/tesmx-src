@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # make_engine.py <openmw-web play/index.html> <out engine.html> <engine stamp>
 # The PlayTab page (index.html, make_page.py) runs OpenMW's own page in a same-origin frame: engine.html is
-# openmw-web's play/index.html with two changes:
+# openmw-web's play/index.html with three changes (the third: the pad drives the menus, below):
 #  - its first script hands its window to the PlayTab page (parent.ptEngineHook) before anything else runs, so the
 #    page puts in its gamepad, its sound chain, the engine files it already downloaded, the resolution, and stops
 #    mouse capture (rule: no mouse capture);
@@ -19,5 +19,11 @@ c = c.replace(head, head + HOOK, 1)
 ver = 'var __ENGINE_VER = "__ENGINE_VERSION__";'
 assert c.count(ver) == 1
 c = c.replace(ver, 'var __ENGINE_VER = "%s";' % stamp)
+# The pad must work everywhere (user's rule): OpenMW's controller menus (d-pad / stick move the selection, A picks,
+# B goes back, in the main menu, character creation, inventory, dialogue, saves...) and tooltips without R3. A baseline
+# value: a player's own settings.cfg still wins.
+cam = "           '[Camera]\\n' +\n"
+assert c.count(cam) == 1
+c = c.replace(cam, "           '[GUI]\\ncontroller menus = true\\ncontroller tooltips = true\\n' +\n" + cam)
 open(out, 'w', encoding='utf-8').write(c)
 print('engine.html written,', stamp)
