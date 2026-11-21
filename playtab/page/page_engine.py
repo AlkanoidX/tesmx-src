@@ -30,6 +30,12 @@ swap("  canvas { width: 100%; height: 100%; display: block; background: #000; ou
 # remote play: copies of the frame's canvas for the stream, drawn at the stream's rate
 swap("""    const frame = new VideoFrame(pixels.slice(), { format: 'RGBA', codedWidth: width, codedHeight: height, timestamp: Math.round(performance.now() * 1000) });
 """, "")
+# The game runs in a frame: a click into it moves the focus there and the page's window gets "blur". Pause only when
+# the focus leaves the whole tab (document.hasFocus() is true while the frame holds it); the frame's own blur is checked
+# the same way, and closing the menu gives the focus back to the game.
+swap("addEventListener('blur', () => { if (autoPause) openMenu(); });\n",
+     "const tesBlur = () => setTimeout(() => { if (autoPause && !document.hasFocus()) openMenu(); }, 0);\naddEventListener('blur', tesBlur);\n")
+swap("  setLayer(null);\n  setPaused(false);\n}\n", "  setLayer(null);\n  setPaused(false);\n  try { const f = document.getElementById('engine-frame'); if (f && !document.body.classList.contains('touch')) f.contentWindow.focus(); } catch (e) {}\n}\n")
 swap("Module.onStreamFrame = (pixels, width, height) => {\n    if (busy) return;", "Module.onStreamFrame = (frame) => {\n    if (busy) return frame.close();")
 swap("  Module._ps2web_stream(1);\n", "  tesStream(true);\n")
 
@@ -156,6 +162,7 @@ window.ptEngineHook = (win) => {
     if (e.code === 'KeyM' && !e.repeat && !layer && !(e.target && /INPUT|TEXTAREA/.test(e.target.tagName))) { e.preventDefault(); e.stopImmediatePropagation(); setInput('key'); openMenu(); }
   }, true);
   win.addEventListener('pointerdown', () => setInput('mouse'), true);
+  win.addEventListener('blur', () => tesBlur());
   win.addEventListener('message', () => {});
 };
 // the engine's frames: openmw-web calls Module._omw_pump_frame once a frame; wrapped so the page counts them and
