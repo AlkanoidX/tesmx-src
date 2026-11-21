@@ -65,6 +65,11 @@ local lastLocalAbs = nil -- our own clock at the previous tick (jump detector ba
 local lastTickAt = nil
 local timeScale = nil
 local timeRequests = 0 -- WorldTimeRequests WE originated (mechanism evidence)
+-- Hours we adopted locally on the strength of a request the server has not answered yet. A
+-- refusal hands them back (see worldmp.timeRefused); a WorldTime clears them, whichever way
+-- it went, because the server's clock is the truth from then on.
+local pendingJump = 0
+local timeRefused = 0 -- refusals received (mechanism evidence)
 local timeApplied = 0 -- WorldTime bodies applied
 
 local ownRegion = nil
@@ -124,6 +129,21 @@ end
 local TIME_FIELDS = { 'gamehour', 'day', 'month', 'year' }
 local timeFields = nil
 local clockWarned = false
+-- DAYSPASSED MOVES WITH THE CALENDAR. The engine's TimeStamp is (gamehour, dayspassed), and
+-- everything that ages by days reads it -- powers once a day, corpse disposal, disease
+-- worsening, levelled respawn. The calendar fields above were written and this one never
+-- was, so a shared clock a day ahead of this engine's boot left every such timer a day
+-- late, and a slew across midnight ran them backwards. It used to be kept relative to what
+-- THIS engine booted with, which made it boot-relative: every relog reset it and no two
+-- engines agreed, so DaysPassed-stamped timers (vampire incubation, lycanthropy, mod
+-- timers) misfired (backlog #150). Now it is a pure function of the calendar: days since
+-- the vanilla start (16 Last Seed, 3E 427 = day 1) in the same totalDays basis absHours
+-- uses, so every engine sharing the clock shares dayspassed.
+local EPOCH_DAYS = math.floor(absHours({ year = 427, month = 8, day = 16, gameHour = 0 }) / 24)
+
+local function daysPassedOf(t)
+    return math.max(1, math.floor(absHours(t) / 24) - EPOCH_DAYS + 1)
+end
 
 local function probeTimeFields()
     if timeFields then return timeFields end
@@ -170,6 +190,10 @@ local function writeLocalTime(t)
     local fields = probeTimeFields()
     local values = { gamehour = t.gameHour, day = t.day, month = t.month - 1, year = t.year }
     local wrote = false
+    pcall(function()
+        local want = daysPassedOf(t)
+        if store['dayspassed'] ~= want then store['dayspassed'] = want end
+    end)
     for _, name in ipairs(TIME_FIELDS) do
         if fields[name] then
             local ok, err = pcall(function() store[name] = values[name] end)
@@ -242,6 +266,7 @@ local function tickClock(now)
             -- Adopt it locally: the server will echo it back as WorldTime and the slew
             -- must not then treat our own rest as a gap to close twice.
             if targetAbs then targetAbs = targetAbs + jump end
+            pendingJump = pendingJump + jump
         end
     end
 
@@ -290,25 +315,40 @@ local function isHolderOf(region)
     return region ~= nil and regionHolder[region] ~= nil and regionHolder[region] == deps.ownIdFn()
 end
 
+local lastWeatherSaidAt = nil
+local WEATHER_RESAY = 60 -- seconds
 local function tickWeather(now)
     if now - lastWeatherAt < WEATHER_POLL then return end
     lastWeatherAt = now
     if not ownRegion or not isHolderOf(ownRegion) then return end
-    local okc, current = pcall(function() return core.weather.getCurrent() end)
+    -- THE CELL IS REQUIRED. core.weather.getCurrent/getNext/getTransition exist only as
+    -- (cell) overloads (mwlua/weatherbindings.cpp overloadForActiveCell); called bare they threw
+    -- inside this pcall, so no holder -- player or peer -- ever sent the weather, every region's
+    -- holder read as silent to the server and was handed off every three minutes, and players
+    -- never shared a sky (s175, #148; weather.silent_holder on the dev box).
+    local p = playerObj()
+    local cell = p and p.cell
+    if not cell then return end
+    local okc, current = pcall(function() return core.weather.getCurrent(cell) end)
     if not okc or not current then return end -- interiors have no sky
     local index = buildWeatherIndex()
     local body = { region = ownRegion, current = index[current.recordId] or 0 }
-    local okn, nextW = pcall(function() return core.weather.getNext() end)
+    local okn, nextW = pcall(function() return core.weather.getNext(cell) end)
     if okn and nextW then body.next = index[nextW.recordId] end
-    local okt, transition = pcall(function() return core.weather.getTransition() end)
+    local okt, transition = pcall(function() return core.weather.getTransition(cell) end)
     if okt and type(transition) == 'number' then
         body.transition = math.max(0, math.min(1, transition))
     end
     local fp = string.format('%s|%d|%s|%.2f', body.region, body.current,
         tostring(body.next), body.transition or 0)
-    if fp == lastWeatherSent then return end
+    -- Re-said once a minute even when unchanged: a guest's refused rest ran their own
+    -- weather forward (advanceTime moves the sky), the rollback does not undo it, and a
+    -- holder that only speaks on change left them under the wrong sky until the next front.
+    if fp == lastWeatherSent and now - (lastWeatherSaidAt or 0) < WEATHER_RESAY then return end
     lastWeatherSent = fp
+    lastWeatherSaidAt = now
     mp.sendEvent('WorldWeather', body)
+    print('[mp] weather said: ' .. fp) -- s175: which half of a missed sky stalled
 end
 
 -- ================================================================== records
@@ -413,15 +453,22 @@ local function recordData(rec)
 end
 
 -- Announce a locally minted record so every client can resolve it by the SERVER's id.
+local unsharable = {} -- local record ids registerRecord refused: said once, not per retry (336)
+local function inFlight(localId)
+    for _, pendingId in pairs(pendingRecords) do
+        if pendingId == localId then return true end
+    end
+    return false
+end
+
 function worldmp.registerRecord(localId)
     if not isDynamicId(localId) or localToNet[localId] then return localToNet[localId] end
+    if unsharable[localId] or inFlight(localId) then return nil end
     local kind, rec = kindOfLocalRecord(localId)
     if not kind then
+        unsharable[localId] = true
         print('[mp] record ' .. tostring(localId) .. ' is not an item kind we can share')
         return nil
-    end
-    for tempId, pendingId in pairs(pendingRecords) do
-        if pendingId == localId then return nil end -- already in flight
     end
     -- An enchanted item REFERENCES another custom record. Its server id only exists once
     -- the server has acked it, so the item's own RecordCreate has to wait for that ack —
@@ -432,7 +479,12 @@ function worldmp.registerRecord(localId)
     if okEnchant and type(enchant) == 'string' and enchant ~= '' and isDynamicId(enchant) then
         worldmp.registerRecord(enchant)
         if not localToNet[enchant] then
-            pendingDeps[localId] = { dep = enchant, until_ = core.getRealTime() + DEP_WAIT_SECONDS }
+            -- Wait only for a dependency that is actually IN FLIGHT (backlog 336): one the
+            -- server cannot register would park this record for DEP_WAIT_SECONDS and then be
+            -- re-asked on every toNet, warning each time.
+            if inFlight(enchant) then
+                pendingDeps[localId] = { dep = enchant, until_ = core.getRealTime() + DEP_WAIT_SECONDS }
+            end
             return nil
         end
     end
@@ -445,6 +497,8 @@ end
 -- Wire id for a local record id (identity for content records).
 toNetId = function(localId) return worldmp.toNet(localId) end
 toLocalId = function(netId) return worldmp.toLocal(netId) end
+
+function worldmp.isDynamicId(id) return isDynamicId(id) end
 
 function worldmp.toNet(localId)
     if localToNet[localId] then return localToNet[localId] end
@@ -504,6 +558,7 @@ handlers.MP_WorldTime = function(data)
     target = data
     targetAbs = targetAbsOf(data)
     timeApplied = timeApplied + 1
+    pendingJump = 0
     -- ADOPT THE WORLD'S CLOCK OUTRIGHT ON ARRIVAL. The server's clock free-runs whether or
     -- not anyone is connected, so a world left alone for an afternoon is game-DAYS ahead of
     -- a client that just booted. Slewing that difference walks the sky through cycle after
@@ -546,7 +601,13 @@ handlers.MP_WorldWeather = function(data)
     -- holder on whatever weather it rolled at boot. Solo, that is a fresh roll every session:
     -- the "weather is randomised on each load" report.
     if isHolderOf(data.region) and data.restore ~= true then return end
-    local rec = weatherRecordAt(data.current)
+    -- TRANSITION WITH THE HOLDER, not after it. changeWeather on the holder starts a transition:
+    -- its `current` stays the OLD weather, with the new one as `next`, until the transition has
+    -- run its game time -- and applying only `current` left everyone else under the old sky for
+    -- the holder's whole transition (s175: 90 s on a slow client and still not there). Start the
+    -- same transition here the moment it begins.
+    local target = (type(data.next) == 'number' and data.next ~= data.current) and data.next or data.current
+    local rec = weatherRecordAt(target)
     if not rec then
         print('[mp] weather index ' .. tostring(data.current) .. ' unknown here')
         return
@@ -556,15 +617,24 @@ handlers.MP_WorldWeather = function(data)
         print('[mp] changeWeather(' .. data.region .. ') failed: ' .. tostring(err))
         return
     end
-    weatherApplied = { region = data.region, current = data.current }
+    weatherApplied = { region = data.region, current = data.current, next = data.next, target = target }
+    print(string.format('[mp] weather applied: %s current=%s next=%s target=%s', data.region, tostring(data.current), tostring(data.next), tostring(target)))
 end
 
 handlers.MP_RecordCreateAck = function(data)
+    if data.tempId == nil then return end -- no key, nothing to clear: t[nil] = nil throws, and a throwing handler goes silent
     local localId = pendingRecords[data.tempId]
     pendingRecords[data.tempId] = nil
     if not localId or type(data.recordNetId) ~= 'string' then return end
     netToLocal[data.recordNetId] = localId
     localToNet[localId] = data.recordNetId
+end
+
+-- The server would not mint the record (caps or ceiling, backlog 323): forget the pending
+-- id so a later ack for a reused tempId cannot bind the wrong local record, and say why.
+handlers.MP_RecordCreateRefused = function(data)
+    if data.tempId ~= nil then pendingRecords[data.tempId] = nil end
+    print('[mp] record refused: ' .. tostring(data.reason))
 end
 
 handlers.MP_RecordsSync = function(data)
@@ -592,42 +662,38 @@ handlers.MP_WorldMapExplored = function(data)
             if mp.revealMapCell then pcall(mp.revealMapCell, key) end
             local gx, gy = key:match('^(-?%d+),(-?%d+)$')
             if gx and mp.setMapExplored then
-                local name = key
+                -- NAMED cells only: vanilla adds a visited location when the player enters
+                -- a named exterior (windowmanagerimp.cpp), never the wilderness. An unnamed
+                -- key fell back to the key itself and painted markers called "3" (backlog 259).
                 local okc, cell = pcall(function() return world.getExteriorCell(tonumber(gx), tonumber(gy)) end)
-                if okc and cell and cell.name and cell.name ~= '' then name = cell.name end
-                local ok, err = pcall(function() mp.setMapExplored(name, tonumber(gx), tonumber(gy)) end)
-                if ok then
-                    applied = applied + 1
-                else
-                    print('[mp] setMapExplored(' .. key .. ') failed: ' .. tostring(err))
+                local name = okc and cell and cell.name or ''
+                if name ~= '' then
+                    local ok, err = pcall(function() mp.setMapExplored(name, tonumber(gx), tonumber(gy)) end)
+                    if ok then
+                        applied = applied + 1
+                    else
+                        print('[mp] setMapExplored(' .. key .. ') failed: ' .. tostring(err))
+                    end
                 end
             end
         end
     end
-    mp.testSet('mapExploredIn', string.format('%.0f', applied))
-end
-
-handlers.MP_GuiMessageBox = function(data)
-    deps.toPlayerFn('MP_Gui', { kind = 'messagebox', guiId = data.guiId,
-        text = data.text, buttons = data.buttons })
-end
-
-handlers.MP_GuiInputDialog = function(data)
-    deps.toPlayerFn('MP_Gui', { kind = 'input', guiId = data.guiId, label = data.label })
-end
-
-handlers.MP_GuiListBox = function(data)
-    deps.toPlayerFn('MP_Gui', { kind = 'list', guiId = data.guiId,
-        label = data.label, items = data.items })
-end
-
--- player.lua answered a dialog (mpGuiReply -> here -> the server).
-function worldmp.sendGuiReply(guiId, replyData)
-    if type(guiId) ~= 'number' then return end
-    mp.sendEvent('GuiReply', { guiId = guiId, data = replyData or {} })
+    mp.set('mapExploredIn', string.format('%.0f', applied))
 end
 
 worldmp.handlers = handlers
+
+-- The server refused our Rest/Wait ([rules] timeSkip: a guest may not fast-forward the
+-- host's game). The engine already advanced OUR clock and the jump detector adopted it into
+-- the target, so without this the refused player lived up to a minute ahead of everyone
+-- else until the next periodic WorldTime slewed them back. Hand the hours back now; the
+-- slew rolls the sky back over a couple of seconds, the same way another player's rest
+-- rolls it forward. social.lua tells the player why.
+function worldmp.timeRefused()
+    if targetAbs and pendingJump > 0 then targetAbs = targetAbs - pendingJump end
+    pendingJump = 0
+    timeRefused = timeRefused + 1
+end
 
 -- ================================================================== region / map
 
@@ -668,21 +734,22 @@ end
 local function mirror()
     local localT = readLocalTime()
     if localT then
-        mp.testSet('gameTime', json.encode({
+        mp.set('gameTime', json.encode({
             gameHour = math.floor((localT.gameHour or 0) * 100 + 0.5) / 100,
             day = localT.day, month = localT.month, year = localT.year,
             abs = math.floor(absHours(localT) * 100 + 0.5) / 100,
         }))
     end
-    mp.testSet('timeScale', timeScale and string.format('%.2f', timeScale) or '')
-    mp.testSet('clockWritable', clockWritable == nil and '' or tostring(clockWritable))
-    mp.testSet('timeApplied', string.format('%.0f', timeApplied))
-    mp.testSet('timeRequests', string.format('%.0f', timeRequests))
-    mp.testSet('region', ownRegion or '')
+    mp.set('timeScale', timeScale and string.format('%.2f', timeScale) or '')
+    mp.set('clockWritable', clockWritable == nil and '' or tostring(clockWritable))
+    mp.set('timeApplied', string.format('%.0f', timeApplied))
+    mp.set('timeRequests', string.format('%.0f', timeRequests))
+    mp.set('timeRefused', string.format('%.0f', timeRefused))
+    mp.set('region', ownRegion or '')
     local holder = ownRegion and regionHolder[ownRegion] or nil
-    mp.testSet('weatherHolder', holder and string.format('%.0f', holder) or 'none')
-    mp.testSet('isWeatherHolder', tostring(isHolderOf(ownRegion)))
-    mp.testSet('weatherApplied', weatherApplied and json.encode(weatherApplied) or '')
+    mp.set('weatherHolder', holder and string.format('%.0f', holder) or 'none')
+    mp.set('isWeatherHolder', tostring(isHolderOf(ownRegion)))
+    mp.set('weatherApplied', weatherApplied and json.encode(weatherApplied) or '')
     local recs = {}
     local described = {}
     for netId, localId in pairs(netToLocal) do
@@ -690,11 +757,11 @@ local function mirror()
         local info = worldmp.describeRecord(localId)
         if info then described[netId] = info end
     end
-    mp.testSet('netRecords', json.encode(recs))
+    mp.set('netRecords', json.encode(recs))
     -- What each shared record actually IS on this client (name/effect/enchantment), so a
     -- scenario can prove the REAL record resolved rather than a same-shaped placeholder.
-    mp.testSet('netRecordInfo', json.encode(described))
-    mp.testSet('recordsSynced', string.format('%.0f', recordsSynced))
+    mp.set('netRecordInfo', json.encode(described))
+    mp.set('recordsSynced', string.format('%.0f', recordsSynced))
 end
 
 local function tickRecordDeps(now)
@@ -733,6 +800,8 @@ function worldmp.reset()
     lastLocalAbs = nil
     lastTickAt = nil
     timeRequests = 0
+    timeRefused = 0
+    pendingJump = 0
     timeApplied = 0
     ownRegion = nil
     regionHolder = {}
@@ -789,7 +858,7 @@ function worldmp.testCreateRecord(name, noRegister)
             world.createObject(rec.id):moveInto(types.Actor.inventory(player))
         end
     end
-    mp.testSet('lastRecordLocalId', rec.id)
+    mp.set('lastRecordLocalId', rec.id)
     return rec.id
 end
 
@@ -819,7 +888,7 @@ function worldmp.testCreateSpell(name)
         return nil
     end
     worldmp.registerRecord(rec.id)
-    mp.testSet('lastSpellLocalId', rec.id)
+    mp.set('lastSpellLocalId', rec.id)
     return rec.id
 end
 
@@ -873,7 +942,7 @@ function worldmp.testCreateEnchanted(name)
     if player then
         world.createObject(armor.id):moveInto(types.Actor.inventory(player))
     end
-    mp.testSet('lastEnchantLocalId', armor.id)
+    mp.set('lastEnchantLocalId', armor.id)
     return armor.id
 end
 
@@ -935,5 +1004,8 @@ end
 function worldmp.init(d)
     deps = d
 end
+
+-- Exposed for the Lua unit runner (wasm-build/lua-tests): the dayspassed math is pure.
+worldmp.daysPassedOf = daysPassedOf
 
 return worldmp

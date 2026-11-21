@@ -198,8 +198,8 @@ build_ffmpeg() {
     `# sound effects as PCM wav. FFmpegDecoder is the ONLY decoder OpenMW has -- it serves`          \
     `# soundmanagerimp.cpp:175 for every sound, not just video -- so without these`                  \
     `# avcodec_find_decoder() returns null for every non-video asset and the game is silent.`        \
-    --enable-decoder=bink,binkaudio_dct,binkaudio_rdft,mp3,pcm_s16le,pcm_u8,pcm_s24le,vorbis \
-    --enable-demuxer=bink,mp3,wav,ogg --enable-parser=mpegaudio \
+    --enable-decoder=bink,binkaudio_dct,binkaudio_rdft,mp3,pcm_s16le,pcm_u8,pcm_s24le,vorbis,adpcm_ima_wav,wmav1,wmav2 \
+    --enable-demuxer=bink,mp3,wav,ogg,asf --enable-parser=mpegaudio \
     --enable-protocol=file \
     `# --extra-ldflags is NOT redundant with --extra-cflags. ffmpeg configure compiles its` \
     `# probe with the cflags but LINKS it with only the ldflags, so under -m64 the object` \

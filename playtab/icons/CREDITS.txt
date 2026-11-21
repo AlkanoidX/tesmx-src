@@ -1,0 +1,3 @@
+Touch button icons from game-icons.net (https://game-icons.net), licence CC BY 3.0 (https://creativecommons.org/licenses/by/3.0/).
+Authors: Lorc (broadsword, hand, crossed-swords, magic-swirl, knapsack, scroll-unfurled, hood), Delapouite (jump-across, night-sleep, eye-target).
+Files as downloaded from github.com/game-icons/icons, named <author>_<name>.svg.

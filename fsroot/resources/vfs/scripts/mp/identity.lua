@@ -15,14 +15,18 @@ local core = require('openmw.core')
 local self = require('openmw.self')
 local types = require('openmw.types')
 local mp = require('openmw.mp')
+local I = require('openmw.interfaces')
 
 local json = require('scripts.mp.json')
 
 local Actor = types.Actor
 local NPC = types.NPC
 
-local INTERVALS = { appearance = 1.0, equipment = 0.5, dynamic = 0.25, progression = 1.0, inventory = 2.0 }
-local INVENTORY_CAP = 512
+-- active 0.1, not 0.5: movement effects (Levitate, Slowfall, Water Walking, Fortify
+-- Acrobatics) must reach and leave the avatar within a tick, or the owner hangs after the
+-- expiry and dips on the cast while the peer catches up (#201).
+local INTERVALS = { appearance = 1.0, equipment = 0.5, dynamic = 0.25, progression = 1.0, inventory = 2.0, active = 0.1 }
+local INVENTORY_CAP = 4096 -- the server's MAX_INVENTORY; 512 silently dropped a collector's later record ids from every declaration and restore
 -- ACQUISITION REPORTING, and why it is a separate faster pass rather than a smaller INTERVAL.
 --
 -- The full PlayerInventory snapshot is a 2 s diff, and the server used to judge "can this player
@@ -40,13 +44,15 @@ local ACQUIRE_INTERVAL = 0.25
 
 local identity = {}
 
-local last = { appearance = nil, equipment = nil, dynamic = nil, progression = nil, spells = nil, inventory = nil }
-local nextAt = { appearance = 0, equipment = 0, dynamic = 0, progression = 0, inventory = 0, acquire = 0 }
+local last = { appearance = nil, equipment = nil, dynamic = nil, progression = nil, spells = nil, inventory = nil, active = nil }
+local lastLook = nil -- the avatar-rebuilding part of the last appearance sent (identity.tick)
+local nextAt = { appearance = 0, equipment = 0, dynamic = 0, progression = 0, inventory = 0, acquire = 0, active = 0 }
 -- recordId -> count, as of the last acquisition pass. Separate from `last.inventory` because
 -- that one only advances on the slow cadence, and comparing against it would re-report the same
 -- gain every 0.25 s until the snapshot caught up.
-local acqCounts = nil
+-- Acquisition baseline (count per record id) lives in `last.acquired` so a StateRefused can forget it (#400).
 local wasDead = false
+local deathSentAt = nil -- the last PlayerDeath sent (resent while still dead)
 local restoring = false -- suppress broadcasts while the rejoin record is being applied
 -- BASELINE GATE. Until this is true we do not know what this character IS yet, so the
 -- persistent halves of the sync stay silent.
@@ -97,6 +103,23 @@ local function snapAppearance()
         hair = orFallback(rec.hair, 'hair'),
         isMale = rec.isMale == true,
         class = orFallback(rec.class, 'class'),
+        -- A CUSTOM CLASS is a record this engine minted at character creation (Generated:0x<n>);
+        -- the next engine has no such record, so the class name, favoured attributes and
+        -- major/minor skills -- everything level-ups are counted against -- were lost on every
+        -- relog and the character wore the boot template's class. Carry the spec; the restore
+        -- rebuilds the record from it (mp.applyChargen).
+        classSpec = (function()
+            local id = rec.class
+            if type(id) ~= 'string' or id:sub(1, 10) ~= 'Generated:' then return nil end
+            local ok, spec = pcall(function()
+                local c = types.NPC.classes.record(id)
+                if not c then return nil end
+                local function list(t) local out = {} for i, v in ipairs(t) do out[i] = v end return out end
+                return { name = c.name, description = c.description or '', specialization = c.specialization,
+                    attributes = list(c.attributes), majorSkills = list(c.majorSkills), minorSkills = list(c.minorSkills) }
+            end)
+            return ok and spec or nil
+        end)(),
         -- BIRTHSIGN. The engine has always been able to apply one (mp.applyChargen ->
         -- setPlayerBirthsign) and nothing ever sent it, so every rejoin dropped it: the sheet
         -- came back blank and buildPlayer's birthsign block granted nothing. The ABILITIES
@@ -112,6 +135,21 @@ local function snapAppearance()
         isWerewolf = (function()
             local ok, v = pcall(function() return NPC.isWerewolf(self) end)
             return (ok and v == true) or nil
+        end)(),
+        -- VAMPIRE FACE. The head swap reads the Vampirism effect on the body, and a puppet never
+        -- had it: the disease spell rides the spellbook, which reaches the AVATAR only, never the
+        -- other players' puppets (backlog 154). Carry the id of the spell that grants it so
+        -- spawnPuppet can add that one spell to the puppet. nil when human.
+        vampireSpell = (function()
+            local found
+            pcall(function()
+                for _, spell in pairs(Actor.spells(self)) do
+                    for _, e in ipairs(spell.effects or {}) do
+                        if e.id == 'vampirism' then found = spell.id return end
+                    end
+                end
+            end)
+            return found
         end)(),
         birthsign = (function()
             local ok, v = pcall(function() return types.Player.getBirthSign(self) end)
@@ -144,16 +182,172 @@ local function snapDynamic()
     return { hp = stat(d.health(self)), mp = stat(d.magicka(self)), ft = stat(d.fatigue(self)) }
 end
 
+-- WHAT THE CLIENT HEALED, MEASURED PER FRAME. While the peer's avatar rules our bars
+-- (player.lua MP_SelfStats writes them ~4 Hz), a potion, resting or a self-cast restore
+-- raises the LOCAL bar between two reports and the next report puts it straight back --
+-- so the 4 Hz diff below rarely saw the raise at all, and the server never heard of it
+-- (measured: sethp to full, peer-reported bars stayed down; a potion healed a fraction).
+-- The heal is still real: it is the sum of the per-frame increases, which no report can
+-- take away. Accumulated here, claimed on top of the peer's last word at the next diff.
+-- Magicka is the same story in BOTH directions: the avatar never casts, so a cast's cost is
+-- a local drop the next report refills (casting was free half the time), and a restore
+-- potion is a local rise it takes away. Health claims gains only (damage is the peer's);
+-- magicka claims the net local change. Fatigue is measured only WHILE RESTING: both engines
+-- regenerate it, so claiming our regen on top of the avatar's would double the recovery rate,
+-- but a rest is hours of game time the avatar never lives (restOnly; the sleep: hook banks it).
+-- NOT CLAIMED, because the avatar does it too (it wears the same items and runs a mirrored copy
+-- of every Fortify/Drain): a move of the stat's MODIFIER (Fortify/Drain Health or Magicka, cast
+-- or worn -- a Fortify Health potion healed its magnitude for free), and what worn constant-effect
+-- Restore Health/Magicka regenerates (restoreId; it ran at twice the rate).
+local tracked = {
+    hp = { stat = 'health', gainsOnly = true, restoreId = 'restorehealth' },
+    mp = { stat = 'magicka', gainsOnly = false, restoreId = 'restoremagicka' },
+    ft = { stat = 'fatigue', gainsOnly = true, restOnly = true },
+}
+-- Per second, what worn constant-effect Restore Health/Magicka gives us, by effect id. Re-read
+-- every 0.5 s of game time: equipping is rare, and activeSpells is not free to walk per frame.
+local equipRestore = { at = -1, rate = {} }
+function identity._equipRestore() return equipRestore end -- test handle
+local function equipRestoreRate(simNow)
+    if simNow - equipRestore.at < 0.5 then return equipRestore.rate end
+    equipRestore.at = simNow
+    local rate = {}
+    pcall(function()
+        for _, sp in pairs(Actor.activeSpells(self)) do
+            if sp.fromEquipment then
+                for _, e in ipairs(sp.effects or {}) do
+                    if (e.id == 'restorehealth' or e.id == 'restoremagicka') and type(e.magnitudeThisFrame) == 'number' then
+                        rate[e.id] = (rate[e.id] or 0) + e.magnitudeThisFrame
+                    end
+                end
+            end
+        end
+    end)
+    equipRestore.rate = rate
+    return rate
+end
+for _, t in pairs(tracked) do t.peer = nil; t.prev = nil; t.delta = 0; t.baseSaid = nil end
+local peerBarsAt = nil -- when the peer last reported; past PEER_RULES_S our own bars rule again
+-- A FALL THIS ENGINE MEASURED. Under the WoW model the avatar is placed on our poses and never
+-- falls by itself (prod 2026-10-23: the longest avatar fall since 1.6.6 was 248 u, against 300-550
+-- before), so it took no fall damage -- and this engine does not apply its own either while the
+-- peer rules the body (character.cpp, peerRulesBody). So the engine hands the amount over
+-- (mp.takeFallDamage) and it rides the next claim as hp.fall; the server takes it off the avatar
+-- ([limits] clientAuthority only, so the replay model, where the avatar falls itself, is not
+-- charged twice).
+local fall = { owed = 0, kd = false }
+identity._fall = fall -- test handle
+function identity.fallWatch()
+    local ok, f = pcall(function() return mp.takeFallDamage and mp.takeFallDamage() or 0 end)
+    if ok and type(f) == 'number' and f > 0 then fall.owed = fall.owed + f end
+    local okK, kd = pcall(function() return mp.takeFallKnockdown and mp.takeFallKnockdown() end)
+    if okK and kd == true then fall.kd = true end
+end
+local PEER_RULES_S = 5 -- server/src/core/players.ts INPUT_DRIVING_MS, the same predicate
+local trackLocalChange -- defined below; the report handler needs it first
+function identity.notePeerBars(hp, mpv, ft)
+    peerBarsAt = core.getRealTime()
+    -- BANK THE LOCAL CHANGE BEFORE THE REPORT OVERWRITES IT. The per-frame measurement runs
+    -- in onUpdate; a heal and a report landing in the same frame BEFORE that -- a rest, a
+    -- potion, then the 4 Hz report -- had the report's write (and its prev) erase the raise
+    -- before it was ever measured. Deterministically so for a rest (s150: 8 hours healed
+    -- nothing that stuck). Measure now, then let the report set the baseline.
+    if trackLocalChange then trackLocalChange() end
+    local v = { hp = hp, mp = mpv, ft = ft }
+    for k, t in pairs(tracked) do
+        if v[k] ~= nil then
+            t.peer = v[k]
+            t.prev = v[k] -- a report's own write is neither a local gain nor a loss
+        end
+    end
+end
+-- A gain this engine PRODUCED and reported itself (mp.restHours returns what the rest
+-- healed): banked into the next claim without a read, because the read is what the peer
+-- report races (notePeerBars above, backlog 460). prev moves with it so the per-frame
+-- tracker does not count the same raise twice when it does get to see it.
+function identity.bankGain(gains)
+    for k, t in pairs(tracked) do
+        local d = tonumber(gains[k])
+        if d and (d > 0 or not t.gainsOnly) then
+            t.delta = t.delta + d
+            if t.prev then t.prev = t.prev + d end
+        end
+    end
+end
+trackLocalChange = function()
+    local simNow = (core.getSimulationTime or core.getRealTime)()
+    local resting = false
+    if tracked.ft.restOnly then pcall(function() resting = I.UI.getMode() == 'Rest' end) end
+    for _, t in pairs(tracked) do
+        local ok, cur, mod = pcall(function()
+            local s = Actor.stats.dynamic[t.stat](self)
+            return s.current, s.modifier or 0
+        end)
+        if ok and cur and t.prev and (resting or not t.restOnly) then
+            local d = (cur - t.prev) - (mod - (t.prevMod or mod))
+            if t.restoreId and t.at then
+                local r = equipRestoreRate(simNow)[t.restoreId]
+                if r and r > 0 then d = d - r * math.max(0, simNow - t.at) end
+            end
+            if d > 0 or not t.gainsOnly then t.delta = t.delta + d end
+        end
+        if ok and cur then t.prev = cur; t.prevMod = mod; t.at = simNow end
+    end
+end
+
 local function snapProgression()
     local attributes, skills = {}, {}
     for _, id in ipairs(ATTRIBUTES) do
-        attributes[id] = Actor.stats.attributes[id](self).base
+        local st = Actor.stats.attributes[id](self)
+        attributes[id] = st.base
+        -- DAMAGE RIDES ALONG, as "<id>_damage" in the same map (no new wire shape): a Damage
+        -- Attribute that outlives its spell, and the Restore that heals it, are facts about
+        -- the character the avatar and the next login must carry, and .base alone lost them.
+        -- ALWAYS SENT, 0 included. It used to ride only while non-zero, and a cure removed the
+        -- key -- which the avatar (avatar.lua applies only keys it is given) read as "no news",
+        -- so a Damage Speed or Strength the owner had cured stayed on the avatar: it ran slower
+        -- or carried less than the owner, and every step was corrected back.
+        attributes[id .. '_damage'] = st.damage or 0
     end
     for _, id in ipairs(skillIds()) do
         skills[id] = NPC.stats.skills[id](self).base
     end
-    return { attributes = attributes, skills = skills, level = Actor.stats.level(self).current }
+    -- The Mark spell's spot (backlog 155): NpcStats only, so nothing carried it and Recall did
+    -- nothing after a relog. nil on an engine without the binding.
+    local mark
+    if mp.getMark then
+        local ok, m = pcall(mp.getMark)
+        if ok and type(m) == 'table' and m.cell ~= '' then mark = m end
+    end
+    -- Reputation (backlog 223): NpcStats only, like the mark, so it reset to 0 on every relog
+    -- and every PcReputation-gated topic vanished. Rides on PlayerLevel.
+    local okRep, rep = pcall(function() return NPC.stats.reputation(self).current end)
+    -- LEVEL PROGRESS: the skill increases counted toward the next level-up. NpcStats-only like the
+    -- mark and the reputation, so it reset to 0 on every relog while the raised skills stayed --
+    -- a player in short sessions never reached the 10 increases that open the level-up dialog.
+    -- The per-attribute counts set that dialog's x1..x5 multipliers, so they travel with it.
+    local progress, attrInc, specInc
+    local okLvl = pcall(function()
+        local lv = Actor.stats.level(self)
+        local p = lv.progress
+        if type(p) ~= 'number' then return end
+        local a, sp = {}, {}
+        for _, id in ipairs(ATTRIBUTES) do
+            local n = lv.skillIncreasesForAttribute[id]
+            if type(n) == 'number' then a[id] = n end
+        end
+        for _, id in ipairs({ 'combat', 'magic', 'stealth' }) do
+            local n = lv.skillIncreasesForSpecialization[id]
+            if type(n) == 'number' then sp[id] = n end
+        end
+        progress, attrInc, specInc = p, a, sp
+    end)
+    if not okLvl then progress, attrInc, specInc = nil, nil, nil end
+    return { attributes = attributes, skills = skills, level = Actor.stats.level(self).current, mark = mark,
+        reputation = okRep and type(rep) == 'number' and rep or nil,
+        progress = progress, attributeIncreases = attrInc, specializationIncreases = specInc }
 end
+
 
 local function snapSpells()
     local set = {}
@@ -163,22 +357,125 @@ local function snapSpells()
     return set
 end
 
+-- ACTIVE EFFECTS, for the avatar. Levitate, Water Walking, Fortify Speed, Chameleon, a potion,
+-- a scroll -- cast or drunk on this client and applied to THIS body only, while the peer's
+-- avatar is what physics and NPC awareness actually run against. An avatar that does not
+-- levitate drags its owner out of the sky through reconciliation; one that is not chameleoned
+-- is seen. Temporary effects only: abilities, diseases and curses ride the spellbook, and
+-- constant-effect enchantments ride equipment, so both are already on the avatar. Keyed by
+-- the engine's own instance id so two potions of the same kind are two entries.
+-- Effects the PEER put on us (global.lua MP_SelfActiveSpells): they came from the avatar, so
+-- they must not go back to it. Counted per record id; MP_PeerEffect on/off maintains it.
+local peerEffects = {}
+function identity.notePeerEffect(id, on)
+    if type(id) ~= 'string' then return end
+    if on then peerEffects[id] = (peerEffects[id] or 0) + 1
+    elseif peerEffects[id] then
+        peerEffects[id] = peerEffects[id] - 1
+        if peerEffects[id] <= 0 then peerEffects[id] = nil end
+    end
+end
+
+-- Instances of PEER-APPLIED records on this body (a paralysis, a poison the world put on the
+-- avatar and the peer relayed here). They are not ours to ADD -- but when one of them
+-- disappears from this body while the peer still counts it, the owner CURED it (Cure
+-- Paralyzation, Cure Poison, Dispel), and the peer must hear that or the avatar stays frozen
+-- and poisoned until the timer runs out, pinning the owner in place through reconciliation.
+local peerLocal = {} -- activeSpellId -> record id
+local function snapActive()
+    local set = {}
+    local peerNow = {}
+    local ok = pcall(function()
+        for _, sp in pairs(Actor.activeSpells(self)) do
+            if sp.temporary and not sp.fromEquipment and sp.activeSpellId ~= nil then
+                if peerEffects[sp.id] then
+                    peerNow[tostring(sp.activeSpellId)] = sp.id
+                else
+                    -- The ROLLED magnitude rides along (-1 = none), so the avatar gets this
+                    -- Fortify Speed 12, not its own roll of 5-15: a different roll is a
+                    -- different speed and reconciliation corrects us every step. An effect
+                    -- still at 0 with a floor above 0 is not rolled yet (added this frame):
+                    -- the instance waits for the next tick rather than go out unrolled.
+                    local idx, mags, rolled = {}, {}, true
+                    for _, e in ipairs(sp.effects or {}) do
+                        if e.index ~= nil then
+                            local m = e.magnitudeThisFrame
+                            if m == 0 and (e.minMagnitude or 0) > 0 then rolled = false end
+                            idx[#idx + 1] = e.index
+                            mags[#idx] = type(m) == 'number' and m or -1
+                        end
+                    end
+                    if #idx > 0 and rolled then set[tostring(sp.activeSpellId)] = { id = sp.id, effects = idx, mags = mags } end
+                end
+            end
+        end
+    end)
+    if not ok then return nil end
+    -- A peer-applied instance that was here and is gone: cured locally. Say so once.
+    local cured = {}
+    for aid, rid in pairs(peerLocal) do
+        if not peerNow[aid] and peerEffects[rid] then
+            cured[#cured + 1] = { key = aid, id = rid }
+            identity.notePeerEffect(rid, false)
+        end
+    end
+    peerLocal = peerNow
+    return set, cured
+end
+
 -- Per-item state the record id cannot express: wear, remaining enchantment charge, and which
--- soul is in a gem. Read through itemData (mwlua/itemdata.cpp exposes condition,
--- enchantmentCharge and soul as read/write properties). nil means "engine default", which is
--- the common case and costs nothing to carry.
+-- soul is in a gem. Read through types.Item.itemData(item) (mwlua/itemdata.cpp exposes condition,
+-- enchantmentCharge and soul as read/write properties). A FUNCTION on types.Item, not a field of
+-- the object: `item.itemData` is nil on every GameObject, and every reader here used that form,
+-- so no condition, charge or soul ever left this client (s160 nil/nil/nil, s163). ONE ENTRY PER STACK (#234), always
+-- carrying the stack size `n`: a stateless stack is a bare {n=k}, so the appliers can walk the
+-- record's stacks in order and split a stack that is bigger than its entry -- an index alone
+-- is not an identity (one Soultrap filled all three gems of a stack; two daggers swapped
+-- conditions per relog).
+--
+-- `own` (#233): a lockpick, probe, repair tool or light wears only HERE -- the avatar never
+-- picks a lock or burns a torch -- so the server copies its condition wholesale instead of
+-- raise-only, and the peer's untouched copy must not refill it.
+local OWN_WEAR_TYPES = {} -- type -> its name, sent as `t` so the server can check the kind (340)
+for _, name in ipairs({ 'Lockpick', 'Probe', 'Repair', 'Light' }) do
+    if types[name] then OWN_WEAR_TYPES[types[name]] = name end
+end
 local function itemState(item)
-    local ok, d = pcall(function() return item.itemData end)
-    if not ok or d == nil then return nil end
-    local st, any = {}, false
+    local st = { n = item.count or 1 }
+    local ok, d = pcall(function() return types.Item.itemData(item) end)
+    if not ok or d == nil then return st end
     local okc, c = pcall(function() return d.condition end)
-    if okc and type(c) == 'number' then st.condition = c; any = true end
+    if okc and type(c) == 'number' then st.condition = c end
     local oke, e = pcall(function() return d.enchantmentCharge end)
-    if oke and type(e) == 'number' then st.charge = e; any = true end
+    if oke and type(e) == 'number' then st.charge = e end
     local oks, sl = pcall(function() return d.soul end)
-    if oks and type(sl) == 'string' and sl ~= '' then st.soul = sl; any = true end
-    if any then return st end
-    return nil
+    if oks and type(sl) == 'string' and sl ~= '' then st.soul = sl end
+    local okt, t = pcall(function() return item.type end)
+    if okt and t ~= nil and OWN_WEAR_TYPES[t] then
+        st.own = true
+        st.t = OWN_WEAR_TYPES[t]
+    end
+    return st
+end
+
+-- BOUND ITEMS ARE NOT POSSESSIONS. A Bound Dagger exists for the spell's duration and the
+-- engine takes it back; the doc recorded it like any dagger, so a relog inside the window
+-- granted a permanent one. The engine names every bound record in a GMST; skip those.
+local boundIds = nil
+local function isBoundRecord(id)
+    if boundIds == nil then
+        boundIds = {}
+        pcall(function()
+            for _, name in ipairs({ 'sMagicBoundBattleAxeID', 'sMagicBoundCuirassID', 'sMagicBoundDaggerID',
+                'sMagicBoundGlovesID', 'sMagicBoundHelmID', 'sMagicBoundLongbowID', 'sMagicBoundLongswordID',
+                'sMagicBoundMaceID', 'sMagicBoundShieldID', 'sMagicBoundSpearID', 'sMagicBoundBootsID',
+                'sMagicBoundLeftGauntletID', 'sMagicBoundRightGauntletID' }) do
+                local v = core.getGMST(name)
+                if type(v) == 'string' and v ~= '' then boundIds[string.lower(v)] = true end
+            end
+        end)
+    end
+    return boundIds[string.lower(tostring(id))] == true
 end
 
 local function snapInventory()
@@ -191,15 +488,14 @@ local function snapInventory()
     -- the grant. Getting the states wrong costs fidelity; it cannot cost items.
     local states = {}
     for _, item in ipairs(Actor.inventory(self):getAll()) do
-        if not counts[item.recordId] then
-            order[#order + 1] = item.recordId
-        end
-        counts[item.recordId] = (counts[item.recordId] or 0) + item.count
-        local st = itemState(item)
-        if st then
+        if not isBoundRecord(item.recordId) then
+            if not counts[item.recordId] then
+                order[#order + 1] = item.recordId
+            end
+            counts[item.recordId] = (counts[item.recordId] or 0) + item.count
             local bucket = states[item.recordId]
             if not bucket then bucket = {}; states[item.recordId] = bucket end
-            bucket[#bucket + 1] = st
+            bucket[#bucket + 1] = itemState(item)
         end
     end
     local items = {}
@@ -225,6 +521,41 @@ local function fingerprint(v)
     return '{' .. table.concat(parts, ',') .. '}'
 end
 
+-- What PlayerLevel declares besides the level: changes whenever a skill increase is counted.
+local function levelExtraFingerprint(prog)
+    if prog.progress == nil then return nil end
+    return fingerprint({ p = prog.progress, a = prog.attributeIncreases, s = prog.specializationIncreases })
+end
+
+-- TALKED-TO (backlog 230). TalkedToPc is a flag on each NPC's CreatureStats, per engine, and
+-- nothing in multiplayer saves it: every NPC greeted a returning character as a stranger.
+-- Read off the actors around us (a conversation happens within reach), sent as it is learned,
+-- persisted on the doc, and put back on every NPC we meet again after a relog.
+local talkedTo = {} -- obj.id -> true (own doc's set; the record seeds it)
+local function talkedToTick()
+    if not (mp.talkedTo and mp.setTalkedTo) then return end
+    local fresh = {}
+    for _, obj in ipairs(require('openmw.nearby').actors) do
+        if obj.contentFile and obj.id ~= self.id then
+            local ok, said = pcall(mp.talkedTo, obj)
+            if ok and said and not talkedTo[obj.id] then
+                talkedTo[obj.id] = true
+                fresh[#fresh + 1] = { ref = obj }
+            elseif ok and not said and talkedTo[obj.id] then
+                pcall(mp.setTalkedTo, obj)
+            end
+        end
+    end
+    if #fresh > 0 then mp.sendEvent('PlayerTalkedTo', { list = fresh }) end
+end
+-- The doc's set at join (SelfTalkedTo): keyed by object id, re-applied as they come near.
+function identity.applyTalkedTo(list)
+    for _, e in ipairs(type(list) == 'table' and list or {}) do
+        local okId, id = pcall(function() return e.ref and e.ref.id end)
+        if okId and id then talkedTo[id] = true end
+    end
+end
+
 -- --- broadcast tick ----------------------------------------------------------------------
 
 -- `sender` overrides the default direct send: M7 routes PlayerEquipment through the global
@@ -245,7 +576,20 @@ end
 function identity.tick(now)
     if restoring then return end
 
-    diffSend('appearance', 'PlayerAppearance', snapAppearance, now)
+    local app = diffSend('appearance', 'PlayerAppearance', snapAppearance, now)
+    if app then
+        -- A NEW LOOK REBUILDS THE AVATAR (global.lua MP_PlayerAppearance: destroy-and-respawn
+        -- on these same keys), and the new body carries none of our temporary effects -- a
+        -- Levitate running at the time dropped us out of the sky. Same cure as a peer
+        -- restart: re-send the active set, which goes out after this appearance.
+        local look = {}
+        for i, k in ipairs({ 'race', 'head', 'hair', 'isMale', 'class', 'birthsign', 'name' }) do look[i] = tostring(app[k]) end
+        look = table.concat(look, '|')
+        if look ~= lastLook then
+            lastLook = look
+            identity.resyncActive()
+        end
+    end
     local eq = diffSend('equipment', 'PlayerEquipment', snapEquipment, now, function(_, snap)
         core.sendGlobalEvent('mpEquipmentOut', snap)
     end)
@@ -253,7 +597,7 @@ function identity.tick(now)
         local ids = {}
         for _, id in pairs(eq.slots) do ids[#ids + 1] = id end
         table.sort(ids)
-        mp.testSet('equippedIds', table.concat(ids, ','))
+        mp.set('equippedIds', table.concat(ids, ','))
     end
 
     local dead = Actor.isDead(self)
@@ -262,22 +606,103 @@ function identity.tick(now)
         last.dynamic = fingerprint(snapDynamic())
         mp.sendEvent('PlayerStatsDynamic', snapDynamic())
         mp.sendEvent('PlayerDeath', {})
+        -- The dead do not talk (backlog 33): close a conversation the killer interrupted,
+        -- which also lets go of the DialogueLock this client holds; the server drops it on
+        -- PlayerDeath too, so a corpse never keeps an NPC refused to everyone else.
+        pcall(function() I.UI.removeMode('Dialogue') end)
     end
+    -- ...AND AGAIN EVERY 5 s WHILE DEAD. The edge fired once; a death the server refused or lost
+    -- (a heal racing it, a reconnect) left the player a corpse for good (s22 #172: hp 0 for five
+    -- minutes, never respawned). The respawn answers either message; alive, nothing is resent.
+    if dead and wasDead and now - (deathSentAt or 0) >= 5 then
+        mp.sendEvent('PlayerDeath', {})
+        deathSentAt = now
+    end
+    if dead and not wasDead then deathSentAt = now end
     wasDead = dead
 
+    identity.fallWatch()
+    trackLocalChange()
     if now >= nextAt.dynamic then
         nextAt.dynamic = now + INTERVALS.dynamic
         local dyn = snapDynamic()
-        mp.testSet('hp', tostring(dyn.hp.c)) -- mirror unconditionally (diff may be seeded)
-        local fp = fingerprint(dyn)
-        if fp ~= last.dynamic then
-            last.dynamic = fp
-            mp.sendEvent('PlayerStatsDynamic', dyn)
+        mp.set('hp', tostring(dyn.hp.c)) -- mirror unconditionally (diff may be seeded)
+        if not baselineReady then
+            -- THE BOOT TEMPLATE'S BARS ARE NOBODY'S. Until the rejoin record lands (or chargen
+            -- ends) this engine is the raw template, and its maximums went out as the
+            -- character's: prod "Control", an Orc due 57 health, was saved at 35/35 and
+            -- magicka 30/50 by the seconds between Joined and MP_ApplyRecord. Progression has
+            -- waited behind this gate since backlog 404; the bars now do too.
+            for _, t in pairs(tracked) do t.delta = 0 end
+            fall.owed = 0
+            fall.kd = false
+        elseif peerBarsAt and now - peerBarsAt < PEER_RULES_S and not dead then
+            -- THE PEER RULES OUR BARS: send only what we changed, on top of what the peer
+            -- last said -- never a bar we merely echo from its report. An echoed report the
+            -- peer has since overtaken (a bite landed, a spend applied) would be taken as a
+            -- fresh claim: the bite undone, the cast refilled (s113).
+            local claim, any = {}, false
+            for k, t in pairs(tracked) do
+                -- A changed MAXIMUM is a claim too (a level-up, endurance, intelligence): the
+                -- base is ours to say, and the avatar must get it or the new maximum exists
+                -- on no body that fights.
+                local baseMoved = t.baseSaid ~= nil and math.abs(dyn[k].b - t.baseSaid) > 0.5
+                if t.peer ~= nil and (math.abs(t.delta) > 0.5 or baseMoved) then
+                    -- THE GAIN RIDES ALONG AS `d` (backlog 461). `c` is `last report + gain`,
+                    -- and the last report is stale for a round trip after every raise the
+                    -- server applies: each claim in that window was BELOW the doc, ignored
+                    -- as an echo, and its gain was zeroed here -- a 10x5 restore reached the
+                    -- avatar as +6..+10 of 50 (s165). The server adds `d` to what it holds.
+                    claim[k] = { c = math.floor(math.max(0, math.min(dyn[k].b, t.peer + t.delta)) + 0.5), b = dyn[k].b,
+                        d = math.floor(t.delta * 10 + 0.5) / 10 }
+                    any = true
+                end
+                t.baseSaid = dyn[k].b
+                t.delta = 0
+            end
+            if fall.owed > 0.5 or fall.kd then
+                -- `fall` is a LOSS: the server only ever subtracts it (and only under the WoW
+                -- model), so a modified client can hurt nobody but itself with it. `kd`: the
+                -- fall knocked us down, so the avatar lies down too.
+                claim.hp = claim.hp or { c = math.floor((tracked.hp.peer or dyn.hp.c) + 0.5), b = dyn.hp.b }
+                if fall.owed > 0.5 then claim.hp.fall = math.floor(fall.owed * 10 + 0.5) / 10 end
+                if fall.kd then claim.hp.kd = true end
+                any = true
+            end
+            fall.owed = 0
+            fall.kd = false
+            if any then
+                mp.sendEvent('PlayerStatsDynamic', claim)
+                if claim.hp then mp.set('hpClaim', string.format('%d+%s', claim.hp.c, tostring(claim.hp.d))) end
+            end
+            last.dynamic = nil -- the next full snapshot (peer gone) must send unconditionally
+        else
+            -- OUR OWN BARS RULE (no fresh report) -- but the server may still be inside its
+            -- own freshness window, in which case it reads this snapshot as a claim, and a
+            -- gain zeroed here without being said was a heal that reached nobody (s150: the
+            -- rest's +24 in a frame the peer's word had gone stale). Say it, then zero it.
+            fall.owed = 0 -- our own bars rule: the drop is already in dyn.hp
+            fall.kd = false
+            local fp = fingerprint(dyn) -- of the bars alone: a gain is not a change to re-send
+            local anyGain = false
+            for k, t in pairs(tracked) do
+                if math.abs(t.delta) > 0.5 then
+                    dyn[k].d = math.floor(t.delta * 10 + 0.5) / 10
+                    anyGain = true
+                end
+                t.delta = 0
+            end
+            if fp ~= last.dynamic or anyGain then
+                last.dynamic = fp
+                mp.sendEvent('PlayerStatsDynamic', dyn)
+                if dyn.hp.d then mp.set('hpClaim', string.format('%d+%s', dyn.hp.c, tostring(dyn.hp.d))) end
+            end
         end
     end
 
     if baselineReady and now >= nextAt.progression then
         nextAt.progression = now + INTERVALS.progression
+        talkedToTick()
         local prog = snapProgression()
         -- Server contract (playerstate.ts parseNumberMap): the body IS the flat map.
         local fp = fingerprint(prog.attributes)
@@ -290,9 +715,22 @@ function identity.tick(now)
             last.skills = sfp
             mp.sendEvent('PlayerSkills', prog.skills)
         end
-        if prog.level ~= last.level then
+        local lfp = levelExtraFingerprint(prog)
+        if prog.level ~= last.level or prog.reputation ~= last.reputation or lfp ~= last.levelExtra then
             last.level = prog.level
-            mp.sendEvent('PlayerLevel', { level = prog.level })
+            last.reputation = prog.reputation
+            last.levelExtra = lfp
+            mp.sendEvent('PlayerLevel', { level = prog.level, reputation = prog.reputation,
+                progress = prog.progress, attributeIncreases = prog.attributeIncreases,
+                specializationIncreases = prog.specializationIncreases })
+        end
+        -- The mark, when the engine can read one; only a SET mark is sent (nothing clears one).
+        if prog.mark then
+            local mfp = fingerprint(prog.mark)
+            if mfp ~= last.mark then
+                last.mark = mfp
+                mp.sendEvent('PlayerMark', prog.mark)
+            end
         end
         -- Spellbook add/remove diff on the same 1 s cadence.
         local spells = snapSpells()
@@ -319,12 +757,16 @@ function identity.tick(now)
         last.spells = spells
     end
 
-    if baselineReady then diffSend('inventory', 'PlayerInventory', snapInventory, now) end
-
     -- Report COUNT INCREASES as they happen. Only increases: a decrease is a drop, a sale or a
     -- use, and the server learns about those from the snapshot — this exists solely to stop the
     -- server's picture being stale in the direction that matters for conservation.
-    if baselineReady and not restoring and now >= nextAt.acquire then
+    -- BEFORE the declaration, and whenever it is due. The server clears its credit ledger on
+    -- each declaration (playerstate.ts handleInventory) and folds what is left into the doc at
+    -- logout. A credit sent AFTER a declaration that already counted the item survived that
+    -- clear and was granted a second time on relog: under load both passes land in one frame
+    -- and this one ran second (s153 #175: 2 of mp_armor_1); unloaded, the 2 s declaration
+    -- could see a gain the 0.25 s pass had not reported yet.
+    if baselineReady and (now >= nextAt.acquire or now >= nextAt.inventory) then
         nextAt.acquire = now + ACQUIRE_INTERVAL
         local counts = {}
         for _, item in ipairs(Actor.inventory(self):getAll()) do
@@ -333,16 +775,59 @@ function identity.tick(now)
         -- The FIRST pass only seeds the baseline. Reporting everything a character already owns
         -- as freshly acquired would credit their whole inventory twice over — once here and
         -- again in the snapshot — and on a rejoin-restore that is the entire restored doc.
-        if acqCounts ~= nil then
+        if last.acquired ~= nil then
             for id, n in pairs(counts) do
-                local before = acqCounts[id] or 0
+                local before = last.acquired[id] or 0
                 if n > before then
-                    mp.sendEvent('PlayerItemAcquired', { id = id, n = n - before })
+                    -- Through global for the record registry, like the inventory itself: sent
+                    -- raw, a just-made item's LOCAL id sat in the server's credit ledger beside the
+                    -- declaration's net id, was folded into the doc at logout, and the relog
+                    -- granted it twice (s153 #148/#154).
+                    core.sendGlobalEvent('mpItemAcquiredOut', { id = id, n = n - before })
                 end
             end
         end
-        acqCounts = counts
+        last.acquired = counts
     end
+
+    -- Through global for the record registry, like equipment and the spellbook: a brewed
+    -- potion or a self-enchanted ring is a `Generated:` id that means nothing to the next
+    -- engine, so an inventory sent raw came back on relog as nothing -- or as whatever
+    -- record the new engine had minted under that number.
+    if baselineReady then
+        diffSend('inventory', 'PlayerInventory', snapInventory, now, function(_, snap)
+            core.sendGlobalEvent('mpInventoryOut', snap)
+        end)
+    end
+
+    -- Behind the baseline like the book and the inventory it is judged against (#359: an add
+    -- needs a spell or item the server knows). Ungated, a chargen cast or Fargoth's ring used
+    -- in the census office went out before either had been declared: refused as
+    -- active_spell_unknown, and the diff cache said it was sent, so the avatar never got it.
+    -- The first pass after the gate opens sends every running effect, after the book and the
+    -- inventory of the same tick.
+    if baselineReady and now >= nextAt.active then
+        nextAt.active = now + INTERVALS.active
+        local active, cured = snapActive()
+        if active then
+            local add, remove = {}, {}
+            for _, c in ipairs(cured or {}) do remove[#remove + 1] = c end
+            for key, sp in pairs(active) do
+                if not (last.active and last.active[key]) then
+                    add[#add + 1] = { key = key, id = sp.id, effects = sp.effects, mags = sp.mags }
+                end
+            end
+            for key, sp in pairs(last.active or {}) do
+                if not active[key] then remove[#remove + 1] = { key = key, id = sp.id } end
+            end
+            if #add > 0 or #remove > 0 then
+                -- Through global for the record registry (toNet), like the spellbook.
+                core.sendGlobalEvent('mpActiveSpellsOut', { add = add, remove = remove })
+            end
+            last.active = active
+        end
+    end
+
 end
 
 -- Rejoin: session ended -> everything must be re-sent on the next join (unless restored).
@@ -350,18 +835,64 @@ end
 -- restore path sets the same flag from applyPhase2. Idempotent.
 function identity.markBaselineReady()
     baselineReady = true
-    mp.testSet('baselineReady', '1')
+    mp.set('baselineReady', '1')
+end
+
+-- THE AVATAR WAS (RE)BUILT -- a peer restart, a body rebuild -- and knows none of our
+-- temporary effects; our diff cache says they were sent, so it would never say them again.
+-- Forget the active set: the next tick re-adds every running effect (adds are idempotent
+-- by instance on the peer's side, which has none after a rebuild). Levitating players were
+-- dragged out of the sky by the new body; chameleoned ones were seen.
+function identity.resyncActive()
+    last.active = nil
+end
+
+-- The server refused a declaration of this event name: drop the cache for that kind so the
+-- next tick re-sends (it may pass then -- the doc it was judged against has moved on).
+local KIND_OF_EVENT = { PlayerAppearance = 'appearance', PlayerEquipment = 'equipment', PlayerInventory = 'inventory',
+    PlayerSpellbook = 'spells', PlayerAttributes = 'progression', PlayerSkills = 'skills', PlayerLevel = 'level',
+    PlayerStatsDynamic = 'dynamic', PlayerMark = 'mark', PlayerActiveSpells = 'active', PlayerItemAcquired = 'acquired' }
+-- Capped (backlog 336): a declaration the server will NEVER accept (a level jump, a record
+-- kind it cannot register) re-sent every tick is an anomaly + warn per tick, forever. Three
+-- retries per kind while the declared value stands still; a changed fingerprint resets it.
+local MAX_FORGETS = 3
+local forgets = {} -- kind -> { fp = fingerprint last forgotten, n = forgets of that fingerprint }
+function identity.forgetDeclared(eventName)
+    local kind = KIND_OF_EVENT[eventName]
+    if not kind then return end
+    local cur = last[kind]
+    local fp = type(cur) == 'table' and fingerprint(cur) or cur
+    local f = forgets[kind]
+    if f and f.fp == fp then
+        f.n = f.n + 1
+    else
+        f = { fp = fp, n = 1 }
+        forgets[kind] = f
+    end
+    if f.n > MAX_FORGETS then return end
+    last[kind] = nil
+end
+
+-- Spells whose add went out under a local id (global.lua mpSpellbookOut): diffed again next
+-- tick, by which time the registry answers with the net id.
+function identity.forgetSpells(ids)
+    if not last.spells then return end
+    for _, id in ipairs(ids or {}) do last.spells[id] = nil end
 end
 
 function identity.reset()
     last = {}
+    forgets = {}
+    for _, t in pairs(tracked) do t.peer = nil; t.prev = nil; t.delta = 0; t.baseSaid = nil end
+    peerBarsAt = nil
     -- nil, NOT {}: the next pass must re-seed the baseline rather than treat the whole restored
     -- inventory as newly acquired.
-    acqCounts = nil
-    nextAt = { appearance = 0, equipment = 0, dynamic = 0, progression = 0, inventory = 0, acquire = 0 }
+    last.acquired = nil
+    nextAt = { appearance = 0, equipment = 0, dynamic = 0, progression = 0, inventory = 0, acquire = 0, active = 0 }
     wasDead = false
     restoring = false
     pendingPhase2 = nil
+    talkedTo = {}
     -- SHUT THE GATE AGAIN. reset() runs every tick while we are not Joined -- a disconnect, a
     -- reconnect, a world hop -- and leaving baselineReady true across that reopens the exact
     -- hole it exists to close: the engine is the raw template again until the new world's
@@ -369,6 +900,7 @@ function identity.reset()
     -- reopened by the same two events as the first time: applyPhase2 for a returning character,
     -- MP_ChargenDone for a brand new one.
     baselineReady = false
+    mp.set('baselineReady', '0') -- the mirror must not keep saying 1 across a reset (it did)
 end
 
 -- --- rejoin restore ----------------------------------------------------------------------
@@ -391,7 +923,14 @@ local function tryApplyEquipment(now)
     if ready or now > equipRetryUntil then
         local ok, err = pcall(Actor.setEquipment, self, pendingEquipment)
         if not ok then print('[mp] restore equipment failed: ' .. tostring(err)) end
-        last.equipment = fingerprint(snapEquipment())
+        -- SAY IT, DO NOT JUST REMEMBER IT. Equipment is not gated on the baseline, so before
+        -- the record landed the boot TEMPLATE's outfit (shoes, shirt, pants, no weapon) already
+        -- went out and the server stored it. Marking the restored set as sent left the server --
+        -- and the avatar, the body that fights -- on the template: a player swinging a mace hit
+        -- with bare hands, and the next relog restored the template (prod 2026-10-22, the
+        -- Addamasartus session: pushes cuirass+mace, then shoes/shirt/pants, then nothing).
+        -- Forgetting the fingerprint sends the real set on the next tick.
+        last.equipment = nil
         pendingEquipment = nil
     end
 end
@@ -406,6 +945,7 @@ function identity.applyRecord(record)
             race = record.appearance.race,
             head = record.appearance.head,
             hair = record.appearance.hair,
+            classSpec = record.appearance.classSpec, -- a custom class, rebuilt when the id is unknown
             isMale = record.appearance.isMale,
             class = record.appearance.class,
             -- Applied by the same call that applies race and class; the binding resolves it
@@ -418,11 +958,7 @@ function identity.applyRecord(record)
             name = record.appearance.name or (mp.getName and mp.getName()) or nil,
         })
     end
-    -- Form is restored with the rest of the look, not in phase 2: applyChargen rebuilds the
-    -- player record, and setting the form before that would be undone by it.
-    if record.appearance and record.appearance.isWerewolf == true then
-        pcall(function() NPC.setWerewolf(self, true) end)
-    end
+    -- Form (werewolf) is restored at the END of phase 2, not here: see applyPhase2.
     pendingPhase2 = record
     phase2At = core.getRealTime() + 0.5
 end
@@ -431,9 +967,27 @@ local function applyPhase2(record)
     local ok, err = pcall(function()
         local stats = record.stats or {}
         if stats.level then Actor.stats.level(self).current = stats.level end
+        if stats.reputation then pcall(function() NPC.stats.reputation(self).current = stats.reputation end) end
+        -- Level progress (see snapProgression). Its own pcall: an engine without the binding, or a
+        -- character that predates the field (nil here), must leave the rest of the restore alone.
+        local lp = stats.levelProgress
+        if type(lp) == 'table' then
+            pcall(function()
+                local lv = Actor.stats.level(self)
+                if type(lp.progress) == 'number' then lv.progress = lp.progress end
+                for id, n in pairs(lp.attributes or {}) do
+                    if type(n) == 'number' then lv.skillIncreasesForAttribute[id] = n end
+                end
+                for id, n in pairs(lp.specializations or {}) do
+                    if type(n) == 'number' then lv.skillIncreasesForSpecialization[id] = n end
+                end
+            end)
+        end
         for id, v in pairs(stats.attributes or {}) do
-            local stat = Actor.stats.attributes[id]
-            if stat then stat(self).base = v end
+            local base = id:match('^(.-)_damage$')
+            local stat = Actor.stats.attributes[base or id]
+            if stat and base then stat(self).damage = v
+            elseif stat then stat(self).base = v end
         end
         for id, v in pairs(stats.skills or {}) do
             local stat = NPC.stats.skills[id]
@@ -442,7 +996,16 @@ local function applyPhase2(record)
         local dyn = stats.dynamic
         if dyn then
             local d = Actor.stats.dynamic
-            if dyn.hp then d.health(self).base = dyn.hp.b; d.health(self).current = dyn.hp.c end
+            if dyn.hp then
+                -- NEVER RESTORE A CORPSE. Death is a flush point, so a player who died and
+                -- closed the tab has hp 0 on record. Writing 0 onto the live player kills
+                -- them on arrival, the death edge fires again (wasDead was reset), the world
+                -- hears "X has fallen" a second time and the respawn plugin runs again --
+                -- at the spot they died, so a bad spot became a loop across rejoins. They
+                -- already paid for that death. Back at a sliver of health, where they fell.
+                d.health(self).base = dyn.hp.b
+                d.health(self).current = (dyn.hp.c > 0) and dyn.hp.c or math.max(1, math.floor(dyn.hp.b * 0.1))
+            end
             if dyn.mp then d.magicka(self).base = dyn.mp.b; d.magicka(self).current = dyn.mp.c end
             if dyn.ft then d.fatigue(self).base = dyn.ft.b; d.fatigue(self).current = dyn.ft.c end
         end
@@ -474,6 +1037,10 @@ local function applyPhase2(record)
                 pcall(function() spells:add(id) end)
             end
         end
+        -- The Mark spot (backlog 155). Its own pcall: an older engine has no setMark.
+        if record.mark and mp.setMark and type(record.mark.cell) == 'string' and record.mark.cell ~= '' then
+            pcall(mp.setMark, record.mark.cell, record.mark.x or 0, record.mark.y or 0, record.mark.z or 0)
+        end
         if record.equipment then
             -- Server doc shape: flat slot->recordId map (persist/playerstore.ts). Items are
             -- granted by global.lua (createObject+moveInto); equip once they land.
@@ -486,6 +1053,13 @@ local function applyPhase2(record)
         end
     end)
     if not ok then print('[mp] restore failed: ' .. tostring(err)) end
+    -- Form LAST. setWerewolf(true) takes a snapshot of the human attributes/skills and lays
+    -- the werewolf modifiers over them; it must run after applyChargen (which rebuilds the
+    -- player record and would undo it) AND after the base writes above, or the snapshot is
+    -- of the chargen defaults and the dawn revert leaves negative modifiers (backlog #153).
+    if record.appearance and record.appearance.isWerewolf == true then
+        pcall(function() NPC.setWerewolf(self, true) end)
+    end
     -- Seed every diff cache from the just-applied state: the first broadcast tick after a
     -- restore must see "no change" (server already holds this snapshot). Appearance is the
     -- exception — peers need the relay — so its cache stays empty.
@@ -498,12 +1072,15 @@ local function applyPhase2(record)
     -- equipment, stats, inventory, the lot. No error surfaced, and the player looks frozen and
     -- empty to everyone else while their own screen is fine.
     local okSeed, seedErr = pcall(function()
-        last.equipment = fingerprint(snapEquipment())
+        last.equipment = nil -- sent again, not assumed: see tryApplyEquipment
         last.dynamic = fingerprint(snapDynamic())
         local prog = snapProgression()
         last.progression = fingerprint(prog.attributes)
         last.skills = fingerprint(prog.skills)
         last.level = prog.level
+        last.reputation = prog.reputation
+        last.levelExtra = levelExtraFingerprint(prog)
+        last.mark = prog.mark and fingerprint(prog.mark) or nil
         last.spells = snapSpells()
         last.inventory = fingerprint(snapInventory())
     end)
@@ -514,7 +1091,7 @@ local function applyPhase2(record)
     end
     restoring = false
     baselineReady = true -- the doc IS the character now; the diffs may speak again
-    mp.testSet('baselineReady', '1')
+    mp.set('baselineReady', '1')
     -- SELF-SILENCING DIAGNOSTIC. Everything the restore writes is `.base`; a freshly restored
     -- character should therefore carry no attribute MODIFIER at all. A live report showed a
     -- level-1 Redguard whose Endurance and Personality both held an IDENTICAL offset (+175, then
@@ -553,7 +1130,7 @@ local function applyPhase2(record)
         end
     end
     print('[mp] rejoin restore applied')
-    mp.testSet('restored', '1')
+    mp.set('restored', '1')
 end
 
 function identity.equipRetryTick(now)

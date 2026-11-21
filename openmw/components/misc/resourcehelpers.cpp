@@ -23,6 +23,7 @@ namespace
     constexpr VFS::Path::ExtensionView kf("kf");
     constexpr VFS::Path::ExtensionView nif("nif");
     constexpr VFS::Path::ExtensionView mp3("mp3");
+    constexpr VFS::Path::ExtensionView wav("wav");
 
     bool changeExtension(std::string& path, std::string_view ext)
     {
@@ -245,6 +246,13 @@ VFS::Path::Normalized Misc::ResourceHelpers::correctSoundPath(
     {
         VFS::Path::Normalized sound(resPath);
         sound.changeExtension(mp3);
+        if (vfs.exists(sound))
+            return sound;
+        // Xbox data: the ESM names voices .mp3, the disc holds Xbox ADPCM .wav files.
+        VFS::Path::Normalized wavSound(resPath);
+        wavSound.changeExtension(wav);
+        if (vfs.exists(wavSound))
+            return wavSound;
         return sound;
     }
     return VFS::Path::Normalized(resPath);

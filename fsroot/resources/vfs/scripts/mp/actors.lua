@@ -11,7 +11,8 @@ local world = require('openmw.world')
 local mp = require('openmw.mp')
 
 local json = require('scripts.mp.json')
-local threat = require('scripts.mp.threat')
+-- teleports refused while another is in flight land on a later frame (latest wins)
+local retry = require('scripts.mp.retry')
 
 local actors = {}
 
@@ -38,13 +39,91 @@ local lastMirror = 0
 local lastAttachSweep = 0
 local watchKillRecord = nil -- record whose shared kill tally the scenarios watch
 local batchesIn = 0 -- diagnostic: ActorMoveBatch frames applied as a non-holder
+-- refKey -> { cellKey, frame }: where MP_ActorCellChange sent an actor. obj.cell still names
+-- the OLD cell until the teleport lands (end of frame, later on a retry), so a puppet
+-- re-attached from a pose in that window recorded the cell it left -- and the destination's
+-- detachActorPuppetsInCell never found it (a frozen NPC under its new holder).
+local movedTo = {}
+local frameNo = 0 -- actors.tick count
 
 -- --------------------------------------------------------------- ref helpers
 
 local function refKeyOf(obj)
-    -- content-file objects only (actors are never runtime-spawned): stable per session.
+    -- local key, stable per session. Runtime-spawned actors (levelled lists, PlaceAt,
+    -- summons) have no content RefNum: they are addressed on the wire by the net id the
+    -- server gave them (actorAddr), and resolved back with actorOf.
     return 'o:' .. obj.id
 end
+
+-- WIRE ADDRESS of an actor: content ref, or the net id of a runtime-spawned one. nil for a
+-- runtime actor the server has not named yet -- it must not travel until it can be resolved
+-- on the other side.
+local function actorAddr(obj)
+    local netId = deps and deps.netIdOf and deps.netIdOf(obj)
+    if netId then return { net = netId } end
+    if obj.contentFile then return { ref = obj } end
+    return nil
+end
+
+-- MAGIC THAT SHOWS ON AN NPC (#296). Everything else in an active effect is the holder's
+-- business (the puppet's bars are a mirror); these change what an observer SEES or how the
+-- streamed pose has to be read: an invisible guard fades, a paralysed one freezes, a
+-- levitating one is not snapped to the floor. Keys are effect ids (core.magic.EFFECT_TYPE).
+local ACTOR_VISIBLE_EFFECT = { invisibility = true, chameleon = true, light = true, levitate = true,
+    slowfall = true, waterwalking = true, paralyze = true, sanctuary = true }
+local function visibleActives(obj)
+    local out = {} -- activeSpellId -> { id = record, effects = { zero-based indexes } }
+    pcall(function()
+        for _, sp in pairs(types.Actor.activeSpells(obj)) do
+            if sp.temporary and not sp.fromEquipment and sp.activeSpellId ~= nil then
+                local idx = {}
+                for _, e in ipairs(sp.effects or {}) do
+                    if e.index ~= nil and ACTOR_VISIBLE_EFFECT[e.id] then idx[#idx + 1] = e.index end
+                end
+                if #idx > 0 then out[sp.activeSpellId] = { id = sp.id, effects = idx } end
+            end
+        end
+    end)
+    return out
+end
+
+-- Fight/Flee/Alarm base values (#229): shared like disposition (a result script's ModFight
+-- or a taunt writes them on ONE engine), so they ride ActorDisposition as `ai`.
+local AI_SETTINGS = { 'fight', 'flee', 'alarm' }
+function actors.aiSettings(obj)
+    local out = {}
+    local ok = pcall(function()
+        for _, k in ipairs(AI_SETTINGS) do out[k] = types.Actor.stats.ai[k](obj).base end
+    end)
+    return ok and out or nil
+end
+local function aiFp(ai)
+    return ai and (tostring(ai.fight) .. '/' .. tostring(ai.flee) .. '/' .. tostring(ai.alarm)) or ''
+end
+
+local function withAddr(body, obj)
+    local a = actorAddr(obj)
+    if not a then return nil end
+    body.ref = a.ref
+    body.net = a.net
+    return body
+end
+
+-- The actor a relayed body names, here: a content ref, or our copy of a net actor.
+local pendingDeaths = {} -- refKey -> true: recorded dead by the world, not yet a puppet here
+local function actorOf(data)
+    if data.net ~= nil and deps and deps.objOfNet then
+        local obj = deps.objOfNet(data.net)
+        if obj and obj:isValid() then return obj end
+        return nil
+    end
+    local ref = data.ref
+    local ok, valid = pcall(function() return ref and ref:isValid() end)
+    return (ok and valid) and ref or nil
+end
+
+-- Runtime actors the holder has asked the server to name (netId pending).
+local netPending = {}
 
 local function cellKeyOf(cell)
     if not cell then return nil end
@@ -52,43 +131,123 @@ local function cellKeyOf(cell)
     return string.lower(cell.name)
 end
 
--- Live NPCs/creatures physically in the given cellKey, excluding the player and any MP
--- puppets (remote-player avatars we spawned — those are driven by player move frames, and
--- driving/broadcasting them as actors would double-drive them).
-local function cellActors(cellKey)
+-- Live NPCs/creatures bucketed by cell key, excluding the player and any MP puppets
+-- (remote-player avatars we spawned — those are driven by player move frames, and
+-- driving/broadcasting them as actors would double-drive them). ONE scan of activeActors:
+-- the holder used to rescan every actor once per held cell per tick (#267).
+local function actorsByCell()
     local out = {}
     for _, obj in ipairs(world.activeActors) do
         if obj:isValid()
             and not types.Player.objectIsInstance(obj)
-            and cellKeyOf(obj.cell) == cellKey
             and not deps.isMpPuppetFn(obj) then
-            out[#out + 1] = obj
+            local key = cellKeyOf(obj.cell)
+            if key then
+                local list = out[key]
+                if not list then list = {}; out[key] = list end
+                list[#list + 1] = obj
+            end
         end
     end
     return out
 end
 
+local function cellActors(cellKey)
+    return actorsByCell()[cellKey] or {}
+end
+
 -- --------------------------------------------------------------- holder mode
+
+-- pcall targets, module-level: a closure per actor per tick was garbage at 20 Hz x N (#267).
+local function speedsOf(obj) return types.Actor.getWalkSpeed(obj), types.Actor.getCurrentSpeed(obj) end
+local function stanceOf(obj) return types.Actor.getStance(obj) end
+-- Bit 3 (use, the player pose's bit): the AI's wind-up-to-release window, plus a spell cast
+-- in flight -- setAttackingOrSpell drops the moment the cast animation starts, so the 10 Hz
+-- sample would miss every spell without the animation read (#288).
+-- The cast half comes from companion.lua on the actor itself (mpActorCasting): openmw.animation
+-- does not load in this global script, and the require used to throw inside the pcall, so no
+-- NPC spell ever reached another screen (s172).
+local casting = {}
+function actors.noteCasting(obj, on)
+    if obj and obj:isValid() then casting[refKeyOf(obj)] = on == true or nil end
+end
+local function attackingOf(obj)
+    return (mp.isAttacking and mp.isAttacking(obj)) or casting[refKeyOf(obj)] == true
+end
+
+-- WHAT THE BODY ACTUALLY DID, per actor: getCurrentSpeed is the formula speed, and a creature
+-- whose run animation carries it (root motion) covers ground well past it -- a mudcrab in
+-- pursuit at 34-80 u/s against a formula 28. The run bit never went out, every other screen
+-- walked it at 28, and it fell behind into a far-gap teleport every few seconds (s190, prod
+-- 2026-10-16 "enemies teleport side to side"). Measured over at least 0.2 s between samples.
+local movedFrom = {}
+-- Pruned, or the peer kept one entry per actor it ever streamed (every summon and respawn is a
+-- new id) for the life of the world. An entry not sampled for 10 s is only a stale baseline.
+local movedPrunedAt = 0
+local function actualSpeed(obj, pos)
+    local key = obj.id
+    local now = core.getRealTime()
+    if now - movedPrunedAt > 30 then
+        movedPrunedAt = now
+        for k, old in pairs(movedFrom) do
+            if now - old.t > 10 then movedFrom[k] = nil end
+        end
+    end
+    local m = movedFrom[key]
+    if not m then movedFrom[key] = { x = pos.x, y = pos.y, t = now, v = 0 }; return 0 end
+    local dt = now - m.t
+    -- 0.5 s, not 0.2: at the peer's 20 fps a 0.2 s window holds 4 frames, so one frame more or
+    -- less read a steady walk 25 % fast -- past the run threshold (see actorPose).
+    if dt >= 0.5 then
+        local d = math.sqrt((pos.x - m.x) ^ 2 + (pos.y - m.y) ^ 2)
+        m.v = d < 512 and d / dt or 0 -- a teleport is not a speed
+        m.x, m.y, m.t = pos.x, pos.y, now
+    end
+    return m.v
+end
 
 local function actorPose(obj)
     local pos = obj.position
-    local walkSpeed = 0
-    local speed = 0
-    pcall(function()
-        walkSpeed = types.Actor.getWalkSpeed(obj)
-        speed = types.Actor.getCurrentSpeed(obj)
-    end)
-    local animVel = walkSpeed > 0 and (speed / walkSpeed) or 0
+    local okV, walkSpeed, speed = pcall(speedsOf, obj)
+    if not okV then walkSpeed, speed = 0, 0 end
+    -- MEASURED ONLY WHERE THE FORMULA LIES. A creature's run animation carries it past its
+    -- formula speed (root motion, s190), so for a creature what it covered decides. An NPC moves
+    -- at exactly its formula speed, run or walk, and the measurement only added noise: a walking
+    -- townsperson read as running for a moment, every other screen played the run, then the
+    -- walk -- "NPCs start sprinting and go back to walking" (prod 2026-10-23).
+    local isNpc = types.NPC.objectIsInstance(obj)
+    local measured = isNpc and 0 or actualSpeed(obj, pos)
+    local animVel = walkSpeed > 0 and (math.max(speed, measured / 1.2) / walkSpeed) or 0 -- 1.2: a walk's measured jitter is not a run
     -- Coarse AI-package hint from motion (reading a foreign actor's AI package is not
     -- exposed to global scripts; motion is a good enough facing/anim hint for puppets).
+    -- Bit 0 (run): types.Actor.isRunning does not exist, so the bit was never set and a running
+    -- guard outpaced its walking puppet into a snap every cooldown (#286). Motion decides:
+    -- faster than a walk is a run.
     local flags = 0
-    local ok, running = pcall(function() return types.Actor.isRunning and types.Actor.isRunning(obj) end)
-    if ok and running then flags = flags + 1 end
+    -- ...and a creature's run has HYSTERESIS: in at 1.15x a walk, out only below 1.02x, so a
+    -- measurement wobbling round one threshold does not flip the gait every window.
+    local m = movedFrom[obj.id]
+    local running = animVel > ((m and m.run) and 1.02 or 1.15)
+    if isNpc then running = animVel > 1.05 end -- the formula is clean: a run is 2-3x a walk
+    if m then m.run = running end
+    if running then flags = flags + 1 end
+    -- Posture (bits 4/5, the player pose's bits): an NPC fighting someone on the holder must
+    -- look like it everywhere else -- weapon out, spell readied -- or a player takes damage
+    -- from a body standing at ease. puppet.lua mirrors the stance; it still never swings.
+    local okS, stance = pcall(stanceOf, obj)
+    if okS then
+        if stance == types.Actor.STANCE.Weapon then flags = flags + 16 end
+        if stance == types.Actor.STANCE.Spell then flags = flags + 32 end
+    end
+    local okU, using = pcall(attackingOf, obj)
+    if okU and using then flags = flags + 8 end
+    local netId = deps and deps.netIdOf and deps.netIdOf(obj)
     return {
-        obj = obj,
+        obj = (not netId) and obj or nil,
+        net = netId,
         x = pos.x, y = pos.y, z = pos.z,
         yaw = obj.rotation:getYaw(),
-        pitch = 0,
+        pitch = obj.rotation:getPitch(), -- flyers/swimmers level off without it (#291)
         flags = flags,
         animVel = animVel,
     }
@@ -102,48 +261,64 @@ local function dynSnapshot(obj)
     return { hp = stat(d.health(obj)), mp = stat(d.magicka(obj)), ft = stat(d.fatigue(obj)) }
 end
 
-local function broadcastCell(cellKey, epoch, cell, now)
+local function broadcastCell(cellKey, epoch, cell, now, live)
     local batch = {}
-    local live = cellActors(cellKey)
-    -- Phase 4: threat decays continuously, so a hit landed a minute ago stops owning the
-    -- fight. Cheap: a multiply per tracked (actor, player) pair, and only for actors in
-    -- the cell we are simulating.
-    threat.decay(now)
+    -- THE WORLD'S RECORD OF THIS CELL, once it is loaded here. The holder used to simulate
+    -- from a vanilla load: a door the players opened stayed shut for its pathing, a smuggler
+    -- they killed stood up again after every restart. The grant asks once too, but the
+    -- engine may not have the cell yet then; the first actor seen is the sure sign it does.
+    if not cell.resynced and #live > 0 then
+        cell.resynced = true
+        mp.sendEvent('ResyncRequest', { cellKey = cellKey })
+    end
+    -- RUNTIME-SPAWNED ACTORS (levelled lists, PlaceAt, summons) exist on this engine only.
+    -- Ask the server to name each one; it becomes a net object every client builds from the
+    -- record (ObjectPlace with actor=true) and this stream addresses by net id. Until it is
+    -- named nothing about it travels -- nobody could resolve it -- so it is left out below.
+    local addressable = {}
+    for _, obj in ipairs(live) do
+        -- COUNT 0 IS GONE. An expired summon is deleted with count 0 and stays valid; listed as
+        -- live it was never "gone" below, so no ObjectDelete went out and every client's copy of
+        -- the skeleton stood there for good, with no pose stream (npcNoPose, prod 2026-10-23).
+        if obj.count == 0 then
+        elseif obj.contentFile or (deps.netIdOf and deps.netIdOf(obj)) then
+            addressable[#addressable + 1] = obj
+        elseif not netPending[obj.id] and deps.requestNetActor
+            -- CONTENT RECORDS ONLY. A levelled creature, a script spawn, a summon: all bodies
+            -- built from a record everyone has. A "Generated:" record is a puppet or avatar
+            -- body this engine minted -- seen here for one tick between despawnPuppet
+            -- forgetting it and the engine removing it -- and naming it made every client
+            -- try to build an actor from a record only this process knows.
+            and not tostring(obj.recordId):lower():match('^generated:') then
+            netPending[obj.id] = true
+            deps.requestNetActor(obj, cellKey)
+        end
+    end
+    live = addressable
     for _, obj in ipairs(live) do
         local key = refKeyOf(obj)
         cell.actors[key] = cell.actors[key] or { deathNo = 0 }
         local tracked = cell.actors[key]
         tracked.obj = obj
         tracked.seen = now
-
-        -- Party scaling applies once, when the actor first enters combat: a member
-        -- arriving must not visibly inflate a health bar mid-fight.
-        if threat.scaling() and types.Actor.isInCombat and pcall(function() return types.Actor.isInCombat(obj) end) then
-            threat.applyScaling(obj, key, false)
-        end
-        -- Sticky aggro: retarget only when a challenger clears the margin, which is what
-        -- stops the enemy strobing between two players and hitting neither.
-        local want = threat.targetOf(key)
-        if want then
-            local target = nil
-            for _, p in ipairs(world.players) do
-                if p:isValid() and deps.playerIdOfFn and deps.playerIdOfFn(p) == want then target = p end
-            end
-            if target then pcall(function() types.Actor.setStance(obj, types.Actor.STANCE.Weapon) end) end
-        end
+        tracked.netId = deps.netIdOf and deps.netIdOf(obj) or nil
 
         batch[#batch + 1] = actorPose(obj)
 
         -- Stats diff (0.25 s min): hp/mp/ft change or death.
+        -- NOT BEFORE THE RECORD (#431): a restarted peer loads the cell alive, and its first
+        -- bars for a recorded corpse (hp 57) reached every puppet a round trip before the
+        -- ResyncRequest above brought the death back and killed the body (s157 in #105).
+        -- Poses are harmless (a dead puppet ignores them); the bars wait for the record.
         local dead = types.Actor.isDead(obj)
-        if not tracked.nextStats or now >= tracked.nextStats then
+        if cell.recorded and (not tracked.nextStats or now >= tracked.nextStats) then
             local dyn = dynSnapshot(obj)
             local fp = dyn.hp.c .. '/' .. dyn.mp.c .. '/' .. dyn.ft.c
             if fp ~= tracked.statsFp then
                 tracked.statsFp = fp
                 tracked.nextStats = now + STATS_MIN_INTERVAL
                 mp.sendEvent('ActorStatsDynamic',
-                    { cellKey = cellKey, epoch = epoch, ref = obj, hp = dyn.hp, mp = dyn.mp, ft = dyn.ft })
+                    withAddr({ cellKey = cellKey, epoch = epoch, hp = dyn.hp, mp = dyn.mp, ft = dyn.ft }, obj))
             end
         end
 
@@ -170,8 +345,25 @@ local function broadcastCell(cellKey, epoch, cell, now)
                     tracked.equipFp = fp
                     tracked.nextEquip = now + EQUIP_MIN_INTERVAL
                     mp.sendEvent('ActorEquip',
-                        { cellKey = cellKey, epoch = epoch, ref = obj, slots = slots })
+                        withAddr({ cellKey = cellKey, epoch = epoch, slots = slots }, obj))
                 end
+            end
+        end
+        -- Visible magic, diffed by instance on the equipment beat (#296): an add per new
+        -- instance, a remove per expiry/dispel. Record ids travel in wire form.
+        if not tracked.nextFx or now >= tracked.nextFx then
+            tracked.nextFx = now + EQUIP_MIN_INTERVAL
+            local present = visibleActives(obj)
+            local add, remove = {}, {}
+            for aid, v in pairs(present) do
+                if not (tracked.fx and tracked.fx[aid]) then add[#add + 1] = { id = deps.toNet(v.id), effects = v.effects } end
+            end
+            for aid, v in pairs(tracked.fx or {}) do
+                if not present[aid] then remove[#remove + 1] = { id = deps.toNet(v.id) } end
+            end
+            tracked.fx = present
+            if #add > 0 or #remove > 0 then
+                mp.sendEvent('ActorEffects', withAddr({ cellKey = cellKey, epoch = epoch, add = add, remove = remove }, obj))
             end
         end
 
@@ -186,11 +378,13 @@ local function broadcastCell(cellKey, epoch, cell, now)
                 local okD, disp = pcall(function()
                     return types.NPC.getBaseDisposition(obj, ownPlayer)
                 end)
-                if okD and type(disp) == 'number' and disp ~= tracked.dispVal then
-                    tracked.dispVal = disp
+                local ai = actors.aiSettings(obj)
+                local dispFp = tostring(disp) .. '|' .. aiFp(ai)
+                if okD and type(disp) == 'number' and dispFp ~= tracked.dispVal then
+                    tracked.dispVal = dispFp
                     tracked.nextDisp = now + EQUIP_MIN_INTERVAL
                     mp.sendEvent('ActorDisposition',
-                        { cellKey = cellKey, epoch = epoch, ref = obj, disposition = disp })
+                        withAddr({ cellKey = cellKey, epoch = epoch, disposition = disp, ai = ai }, obj))
                 end
             end
         end
@@ -202,12 +396,19 @@ local function broadcastCell(cellKey, epoch, cell, now)
             mp.sendEvent('ActorDeath', {
                 cellKey = cellKey,
                 epoch = epoch,
-                ref = obj,
+                ref = actorAddr(obj) and actorAddr(obj).ref or nil,
+                net = actorAddr(obj) and actorAddr(obj).net or nil,
                 killerPlayerId = deps.ownIdFn(), -- holder attribution; nil-safe on the server
                 deathNo = tracked.deathNo,
                 killedRecordId = obj.recordId,
             })
+            if deps.corpseFn then pcall(deps.corpseFn, obj) end -- #297: our copy is the loot
         elseif not dead then
+            -- Revive edge (#293): a scripted Resurrect on the holder stands the actor up
+            -- everywhere, and the server forgets the death so a cell entry stops re-killing it.
+            if tracked.dead then
+                mp.sendEvent('ActorRevive', withAddr({ cellKey = cellKey, epoch = epoch }, obj))
+            end
             tracked.dead = false
         end
     end
@@ -223,21 +424,27 @@ local function broadcastCell(cellKey, epoch, cell, now)
     for key, tracked in pairs(cell.actors) do
         if tracked.seen ~= now then
             local obj = tracked.obj
-            if obj and obj:isValid() then
+            if obj and obj:isValid() and obj.count > 0 then
                 local toCell = cellKeyOf(obj.cell)
                 -- toCell == cellKey would mean it is still here and we merely missed it this
                 -- pass; only a real move is worth an event.
                 if toCell and toCell ~= cellKey and tracked.leftTo ~= toCell then
                     tracked.leftTo = toCell
                     local pos = obj.position
-                    mp.sendEvent('ActorCellChange', {
-                        cellKey = cellKey, epoch = epoch, ref = obj, toCellKey = toCell,
+                    local body = withAddr({
+                        cellKey = cellKey, epoch = epoch, toCellKey = toCell,
                         x = pos.x, y = pos.y, z = pos.z,
-                    })
+                    }, obj)
+                    if body then mp.sendEvent('ActorCellChange', body) end
                 end
             else
                 -- Gone entirely (unloaded or destroyed). Drop the row so a recycled key
-                -- cannot inherit a stale leftTo and swallow a later, real move.
+                -- cannot inherit a stale leftTo and swallow a later, real move. A NAMED
+                -- runtime actor that is gone here (a script's Disable/SetDelete, a summon
+                -- expiring) is gone everywhere: every client holds a copy built from our word.
+                if tracked.netId then
+                    mp.sendEvent('ObjectDelete', { net = tracked.netId, cellKey = cellKey })
+                end
                 cell.actors[key] = nil
             end
         else
@@ -245,22 +452,33 @@ local function broadcastCell(cellKey, epoch, cell, now)
         end
     end
 
-    if #batch > 0 then
-        mp.sendActorMoveBatch(epoch, batch)
+    -- The wire count is a u8 (netmanager.cpp caps at 255): a bigger cell goes out as
+    -- several batches or actor 256+ never moves (#271).
+    for i = 1, #batch, 255 do
+        mp.sendActorMoveBatch(epoch, { table.unpack(batch, i, math.min(i + 254, #batch)) })
     end
 end
 
 local function snapshotCell(cellKey, epoch)
     local snapActors = {}
+    local ownPlayer = world.players[1]
     for _, obj in ipairs(cellActors(cellKey)) do
         local dyn = dynSnapshot(obj)
-        snapActors[#snapActors + 1] = {
-            ref = obj,
+        local addr = actorAddr(obj)
+        -- Disposition rides in the snapshot: persuaded, bribed or threatened is a fact about
+        -- the NPC that a fresh holder (a restarted peer) must inherit, not re-roll from the record.
+        local disp = nil
+        if ownPlayer and ownPlayer:isValid() and types.NPC.objectIsInstance(obj) then
+            pcall(function() disp = types.NPC.getBaseDisposition(obj, ownPlayer) end)
+        end
+        if addr then snapActors[#snapActors + 1] = {
+            ref = addr.ref, net = addr.net,
             x = obj.position.x, y = obj.position.y, z = obj.position.z,
             rotZ = obj.rotation:getYaw(),
             hp = dyn.hp, mp = dyn.mp, ft = dyn.ft,
             dead = types.Actor.isDead(obj),
-        }
+            disp = disp,
+        } end
     end
     mp.sendEvent('ActorSnapshot', { cellKey = cellKey, epoch = epoch, actors = snapActors })
 end
@@ -270,22 +488,38 @@ end
 local function attachActorPuppets(cellKey)
     for _, obj in ipairs(cellActors(cellKey)) do
         local key = refKeyOf(obj)
-        if not puppetActors[key] then
+        -- A stale row (the object it named was removed -- a named runtime actor deleted, a
+        -- corpse disposed -- and the engine reused the slot) must not block the new actor.
+        local have = puppetActors[key]
+        if have then
+            local okv, same = pcall(function() return have.obj:isValid() and have.obj.id == obj.id end)
+            if not (okv and same) then have = nil end
+        end
+        if not have then
             local ok = pcall(function()
                 obj:addScript('scripts/mp/puppet.lua', { actorKey = key })
             end)
-            if ok then puppetActors[key] = { obj = obj, cellKey = cellKey } end
+            if ok then
+                puppetActors[key] = { obj = obj, cellKey = actors.cellKeyFor(key, obj) }
+                -- Died before we got here: the world says so; the body must agree.
+                if pendingDeaths[key] then
+                    pendingDeaths[key] = nil
+                    pcall(function() obj:sendEvent('MP_Kill', {}) end)
+                end
+            end
         end
     end
 end
 
-local function detachActorPuppetsInCell(cellKey)
+-- `degraded`: the peer is gone (holder lost), not a departure -- the puppet keeps its script
+-- and hit intercept so outage swings cancel (backlog 328, puppet.lua MP_Detach).
+local function detachActorPuppetsInCell(cellKey, degraded)
     for key, p in pairs(puppetActors) do
         if p.cellKey == cellKey and p.obj:isValid() then
             -- Only signal: the puppet re-enables AI and removes ITSELF (see puppet.lua's
             -- MP_Detach). Removing the script from here raced the queued event and left
-            -- mDisableAI stuck on, freezing the cell's NPCs after every handoff.
-            pcall(function() p.obj:sendEvent('MP_Detach', {}) end)
+            -- mDisableAI stuck on, freezing the cell's NPCs on every peer restart.
+            pcall(function() p.obj:sendEvent('MP_Detach', { degraded = degraded == true }) end)
             puppetActors[key] = nil
         end
     end
@@ -308,30 +542,35 @@ actors.handlers = {}
 actors.handlers.MP_ActorAuthorityGrant = function(data)
     local cellKey = data.cellKey
     if not cellKey then return end
-    -- Inherit the outgoing holder's threat state: without it every fight in the cell
-    -- visibly forgets who it was angry at the moment authority moves.
-    if data.snapshot and data.snapshot.threat then threat.import(data.snapshot.threat) end
+    -- ONLY THE SIM PEER IS EVER GRANTED (server authority.ts: canSimulate = system only), so
+    -- this and Revoke below run on the peer alone; a browser client only ever sees Info.
+    -- There is no human holder and no handoff between clients -- the "previous holder" a
+    -- snapshot comes from is this same peer's earlier life, or the cell doc.
     -- Becoming holder: detach any puppets we had on these actors, apply the snapshot, and
     -- the engine's own AI resumes (mDisableAI cleared by MP_Detach).
     detachActorPuppetsInCell(cellKey)
     holderOfCell[cellKey] = deps.ownIdFn()
     held[cellKey] = { epoch = data.epoch or 0, actors = {} }
+    mp.sendEvent('ResyncRequest', { cellKey = cellKey }) -- doors, locks, the dead (see broadcastCell)
     -- Apply the handoff snapshot: teleport actors to their last authoritative pose + stats.
     local snap = data.snapshot and data.snapshot.actors or {}
     for _, a in ipairs(snap) do
-        local obj = a.ref and a.ref:isValid() and a.ref or nil
+        -- A dead entry stays where the death left it: teleport + hp 0 here re-killed every
+        -- respawned guard at each re-anchor. WorldCellState -> noteCellDeaths re-asserts a
+        -- death that still stands (#287).
+        local obj = (not a.dead) and actorOf(a) or nil
         if obj then
             local cellArg = obj.cell and not obj.cell.isExterior and obj.cell.name or ''
-            pcall(function()
-                obj:teleport(cellArg, util.vector3(a.x, a.y, a.z),
-                    { rotation = util.transform.rotateZ(a.rotZ or 0) })
-            end)
-            pcall(function()
-                local d = types.Actor.stats.dynamic
-                if a.hp then d.health(obj).base = a.hp.b; d.health(obj).current = a.hp.c end
-                if a.mp then d.magicka(obj).base = a.mp.b; d.magicka(obj).current = a.mp.c end
-                if a.ft then d.fatigue(obj).base = a.ft.b; d.fatigue(obj).current = a.ft.c end
-            end)
+            retry.teleport(obj, cellArg, util.vector3(a.x, a.y, a.z), nil,
+                { rotation = util.transform.rotateZ(a.rotZ or 0) })
+            -- Self-gated write: the actor's own script (companion.lua mpSetStats) applies it.
+            pcall(function() obj:sendEvent('mpSetStats', { hp = a.hp, mp = a.mp, ft = a.ft }) end)
+            if type(a.disp) == 'number' then
+                local ownPlayer = world.players[1]
+                if ownPlayer and ownPlayer:isValid() then
+                    pcall(function() types.NPC.setBaseDisposition(obj, ownPlayer, a.disp) end)
+                end
+            end
         end
     end
     print('[mp] actor authority GRANTED for ' .. cellKey .. ' epoch ' .. tostring(data.epoch))
@@ -341,13 +580,36 @@ actors.handlers.MP_ActorAuthorityRevoke = function(data)
     local cellKey = data.cellKey
     if not cellKey or not held[cellKey] then return end
     held[cellKey] = nil
-    -- We are no longer the holder: re-attach puppets so the new holder drives these actors.
+    -- The peer walked its avatar out of a cell it still occupies via another anchor; the
+    -- server re-grants at once (there is nobody else to hand it to). Attach in the gap.
     attachActorPuppets(cellKey)
     print('[mp] actor authority REVOKED for ' .. cellKey)
 end
 
 actors.handlers.MP_ActorAuthorityInfo = function(data)
     if data.cellKey then
+        -- HOLDER LOST (peer gone): the server sends this with no holderId. Clear the mirror
+        -- and DETACH this cell's actor puppets so their AI re-enables and the client
+        -- simulates them locally (degraded mode). Detach is correct here -- this is loss,
+        -- not a handoff to another holder -- and local AI is the only fallback with no peer.
+        -- LOSING IT ANYWHERE IS LOSING IT EVERYWHERE (#295). The peer is the only holder, so
+        -- a lost holder means the peer is gone, and the puppets it drove in the neighbouring
+        -- cells (attached off ActorMoveBatch, never Info'd, so absent from the mirror) are
+        -- frozen too. Clear the whole mirror and detach every puppet; a live holder
+        -- re-attaches them on its next pose, which is the path a late attach already takes.
+        if data.holderId == nil then
+            -- Every cell, degraded (#328): the puppets keep their script armed so an outage
+            -- swing still cancels; the whole mirror clears (#295).
+            for key in pairs(held) do detachActorPuppetsInCell(key, true) end
+            for key, p in pairs(puppetActors) do
+                if p.obj:isValid() then pcall(function() p.obj:sendEvent('MP_Detach', { degraded = true }) end) end
+                puppetActors[key] = nil
+            end
+            held = {}
+            holderOfCell = {}
+            infoEpoch = {}
+            return
+        end
         holderOfCell[data.cellKey] = data.holderId
         -- M5 needs the LIVE epoch to address actor targets, and a non-holder only ever sees
         -- Info. Read it defensively: older servers omit it (combat on non-held cells is then
@@ -366,7 +628,7 @@ actors.handlers.MP_ActorMoveBatch = function(batch)
     local now = core.getRealTime()
     batchesIn = batchesIn + 1
     for _, e in ipairs(batch) do
-        local obj = e.ref and e.ref:isValid() and e.ref or nil
+        local obj = actorOf(e)
         if obj and not types.Player.objectIsInstance(obj) then
             local key = refKeyOf(obj)
             if not puppetActors[key] then
@@ -375,9 +637,10 @@ actors.handlers.MP_ActorMoveBatch = function(batch)
                 local ok = pcall(function()
                     obj:addScript('scripts/mp/puppet.lua', { actorKey = key })
                 end)
-                if ok then puppetActors[key] = { obj = obj, cellKey = cellKeyOf(obj.cell) } end
+                if ok then puppetActors[key] = { obj = obj, cellKey = actors.cellKeyFor(key, obj) } end
             end
             e.t = now
+            e.actorKey = key -- re-arms a puppet detached a moment ago (puppet.lua MP_Pose)
             pcall(function() obj:sendEvent('MP_Pose', e) end)
         end
     end
@@ -387,7 +650,7 @@ end
 -- puppet stands where the pose stream stopped -- which is what left a travelling companion
 -- behind for everyone except the player who recruited them.
 actors.handlers.MP_ActorCellChange = function(data)
-    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    local obj = actorOf(data)
     if not obj or type(data.toCellKey) ~= 'string' then return end
     local key = refKeyOf(obj)
     -- DETACH FIRST. The puppet script suppresses this actor's own AI, and it is keyed to the
@@ -399,15 +662,51 @@ actors.handlers.MP_ActorCellChange = function(data)
         pcall(function() p.obj:sendEvent('MP_Detach', {}) end)
         puppetActors[key] = nil
     end
-    pcall(function()
-        obj:teleport(data.toCellKey, util.vector3(data.x or 0, data.y or 0, data.z or 0))
-    end)
+    -- AN EXTERIOR KEY IS NOT A CELL NAME. teleport() takes a cell NAME (interiors) or '' for
+    -- the exterior, where the position picks the grid square; "x,y" is our own key and the
+    -- engine looked it up as a name, failed inside the pcall, and the actor never arrived --
+    -- so every NPC that walked outdoors kept standing indoors on every other screen.
+    local cellArg = data.toCellKey:match('^%-?%d+,%-?%d+$') and '' or data.toCellKey
+    movedTo[key] = { cellKey = data.toCellKey, frame = frameNo }
+    retry.teleport(obj, cellArg, util.vector3(data.x or 0, data.y or 0, data.z or 0))
 end
 
 actors.handlers.MP_ActorStatsDynamic = function(data)
-    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    local obj = actorOf(data)
     if obj and puppetActors[refKeyOf(obj)] then
         pcall(function() obj:sendEvent('MP_Stats', { hp = data.hp, mp = data.mp, ft = data.ft }) end)
+    end
+end
+
+-- The holder says what magic SHOWS on this actor (#296). Applied in place: activeSpells:add is
+-- a global-context call for a foreign actor, and the puppet's own engine expires a timed
+-- effect on the same clock; a remove after that is a no-op. Same shape as the avatar path
+-- (global.lua MP_AvatarActiveSpells): stackable per instance, resistances already rolled.
+actors.handlers.MP_ActorEffects = function(data)
+    local obj = actorOf(data)
+    if not obj or not puppetActors[refKeyOf(obj)] then return end
+    local spells = types.Actor.activeSpells(obj)
+    for _, sp in ipairs(data.add or {}) do
+        local localId = sp.id and deps.toLocal(sp.id)
+        if localId and type(sp.effects) == 'table' and #sp.effects > 0 then
+            pcall(function()
+                spells:add({ id = localId, effects = sp.effects, caster = obj, stackable = true,
+                    ignoreResistances = true, ignoreSpellAbsorption = true, ignoreReflect = true, quiet = true })
+            end)
+        end
+    end
+    for _, sp in ipairs(data.remove or {}) do
+        local localId = sp.id and deps.toLocal(sp.id)
+        if localId then
+            pcall(function()
+                for _, active in pairs(spells) do
+                    if active.temporary and active.id == localId and active.activeSpellId then
+                        spells:remove(active.activeSpellId)
+                        break
+                    end
+                end
+            end)
+        end
     end
 end
 
@@ -418,11 +717,22 @@ end
 -- disposition lives on the actor's own stats, and setBaseDisposition is a GLOBAL-context call
 -- (local scripts may only modify themselves), which is the context this handler runs in.
 actors.handlers.MP_ActorDisposition = function(data)
-    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    local obj = actorOf(data)
     if not obj or type(data.disposition) ~= 'number' then return end
     local ownPlayer = world.players[1]
     if not (ownPlayer and ownPlayer:isValid()) then return end
     pcall(function() types.NPC.setBaseDisposition(obj, ownPlayer, data.disposition) end)
+    -- FIGHT/FLEE/ALARM ON THE ACTOR. Stat setters are Self-gated (mwlua/stats.cpp), unlike
+    -- setBaseDisposition: written from here they threw inside the pcall and no AI setting
+    -- ever reached another client. companion.lua (on every NPC and creature) writes them.
+    if type(data.ai) == 'table' then
+        local ai = {}
+        for _, k in ipairs(AI_SETTINGS) do
+            local v = tonumber(data.ai[k])
+            if v then ai[k] = math.floor(v) end
+        end
+        if next(ai) then pcall(function() obj:sendEvent('mpSetStats', { ai = ai }) end) end
+    end
 end
 
 -- COMPANIONS, the sending half. Called from global.lua when an actor's OWN script reports a
@@ -432,37 +742,358 @@ end
 --
 -- Holder-only, like every other actor fact: two clients both announcing the same follower
 -- would fight over it, and the holder is the one whose simulation is authoritative anyway.
-function actors.noteFollow(obj, target)
+local claimedFollow = {} -- refKey -> true: actors we told the server follow US while not holding
+
+function actors.noteFollow(obj, target, escort)
     if not (obj and obj:isValid()) then return end
     local cellKey = actors.cellKeyOfObj(obj)
-    if not cellKey or not actors.isHolderOf(cellKey) then return end
+    if not cellKey then return end
     -- nil target is a real value here: it means 'stopped following', which has to travel or a
     -- dismissed companion keeps trailing everyone else forever.
     local followId = deps.playerIdOf and deps.playerIdOf(target) or nil
-    mp.sendEvent('ActorAI', {
-        cellKey = cellKey, epoch = actors.epochOf(cellKey), ref = obj, follow = followId,
-    })
+    local epoch = actors.epochOf(cellKey)
+    if not actors.isHolderOf(cellKey) then
+        -- RECRUITING IS A DIALOGUE ACTION, and dialogue runs on the recruiting player's own
+        -- client -- which, on a peer-simulated world, is never the holder. Holder-only here
+        -- meant the fact was born on a non-holder and thrown away, so no companion ever
+        -- followed anyone on any screen. A non-holder may still say exactly one thing about an
+        -- actor: "this one now follows ME" (or stopped). The server holds it to that
+        -- (worldstate.ts followClaim) and relays it to the holder, who starts the package.
+        local key = refKeyOf(obj)
+        local own = deps.ownIdFn and deps.ownIdFn() or nil
+        if followId ~= nil and followId ~= own then
+            pcall(function() mp.set('followClaim', 'not-mine:' .. tostring(followId) .. '/' .. tostring(own)) end)
+            return
+        end
+        if followId == nil and not claimedFollow[key] then return end
+        claimedFollow[key] = (followId ~= nil) or nil
+        epoch = epoch or 0 -- a claim is not epoch-checked; the field only has to be present
+    end
+    local body = withAddr({
+        cellKey = cellKey, epoch = epoch, follow = followId,
+        escort = (followId ~= nil and type(escort) == 'table') and escort or nil,
+    }, obj)
+    -- Scenario mirror (s114): what went out, or why nothing did.
+    pcall(function() mp.set('followClaim', body and ('sent:' .. tostring(followId)) or 'no-addr') end)
+    if body then mp.sendEvent('ActorAI', body) end
+end
+
+-- PERSUASION, the sending half. Called by quests.lua when a conversation ends and the NPC's
+-- disposition is not what it was when it began. The server admits it from the player who
+-- held that NPC's dialogue lock (worldstate.ts), so this is sent BEFORE the lock is released.
+function actors.noteDisposition(obj, disposition, ai)
+    if not (obj and obj:isValid()) or type(disposition) ~= 'number' then return end
+    local cellKey = actors.cellKeyOfObj(obj)
+    if not cellKey then return end
+    local body = withAddr({
+        cellKey = cellKey, epoch = actors.epochOf(cellKey) or 0,
+        disposition = math.max(0, math.min(100, math.floor(disposition + 0.5))),
+        ai = ai, -- #229: Fight/Flee/Alarm the conversation changed (nil = unchanged)
+    }, obj)
+    if body then mp.sendEvent('ActorDisposition', body) end
+end
+
+-- COMBAT STATE, the sending half. Holder-only (the holder is where the fight is real): who
+-- this actor is fighting, when that is a player. Rides ActorAI with a `combat` field so the
+-- client's AI-off puppet can be put into the same state and vanilla's own checks -- rest
+-- refused while an enemy is on you, no greeting from someone swinging at you -- read true.
+-- refKey -> true while the actor's own script last reported a Combat package with a live
+-- target (any target, not only a player). Global context cannot read an actor's AI stack,
+-- so this is the only "is it fighting" the follow-teleport (global.lua) can ask.
+local inCombat = {}
+
+-- The dialogue lock lives in quests.lua; required lazily (both load inside global.lua).
+local function talkingTo(obj)
+    local ok, quests = pcall(require, 'scripts.mp.quests')
+    return ok and type(quests) == 'table' and quests.isTalkingTo ~= nil and quests.isTalkingTo(obj) == true
+end
+
+function actors.inCombat(obj)
+    return inCombat[refKeyOf(obj)] == true
+end
+
+function actors.noteCombat(obj, target)
+    if not (obj and obj:isValid()) then return end
+    inCombat[refKeyOf(obj)] = (target ~= nil) or nil
+    local cellKey = actors.cellKeyOfObj(obj)
+    if not cellKey then return end
+    local foeId = deps.playerIdOf and deps.playerIdOf(target) or nil
+    if not actors.isHolderOf(cellKey) then
+        -- Not ours to say -- except "it now fights ME", the result of a taunt or of resisting
+        -- arrest, which happens on this client and nowhere else. The server admits it from the
+        -- player who was just talking to the NPC (worldstate.ts), and the holder starts the fight.
+        -- NEVER FROM THE PEER (#430): its dummy body talks to nobody, and a slaughterfish that
+        -- drifts into the next cell to bite it produced this claim per frame, refused per frame.
+        local own = deps.ownIdFn and deps.ownIdFn() or nil
+        if foeId == nil or foeId ~= own or (mp.isSystem and mp.isSystem()) then return end
+        -- ONLY FROM THE CONVERSATION (s171). The holder's own fight reaches this puppet as
+        -- MP_ActorAI and stacks a Combat package on it; companion.lua then read that package
+        -- back and claimed it as ours -- refused by the server, every time a creature engaged.
+        if not talkingTo(obj) then return end
+    end
+    local body = withAddr({
+        cellKey = cellKey, epoch = actors.epochOf(cellKey) or 0, combat = foeId or false,
+    }, obj)
+    if body then mp.sendEvent('ActorAI', body) end
+end
+
+-- SCRIPTED TRAVEL. "AITravel x y z" from a dialogue result OR a world script (Fargoth's
+-- lookoutScript walks him to the stump when the journal, the hour and GetDistance Player say so --
+-- none of which the peer's dummy player ever meets) stacks Travel on the player's puppet; the
+-- holder's copy never moves. The holder reports its own travel too (it is authoritative); a
+-- non-holder reports a CHANGE of its puppet's travel -- on an AI-off puppet the only way the
+-- active package changes IS a script -- except the two things that are not ours to claim: the
+-- package the record carried when the puppet was first read (`initial`), and the one the holder
+-- relayed (appliedTravel). worldstate.ts admits it from a human near the cell, within two cells of
+-- the NPC, and rate-bounded when there is no conversation.
+local appliedTravel = {} -- refKey -> "x,y,z" of the Travel the holder's relay last stacked here
+local function travelKeyOf(x, y, z) return string.format('%.0f,%.0f,%.0f', x, y or 0, z or 0) end
+function actors.noteTravel(obj, dest, initial)
+    if not (obj and obj:isValid()) or type(dest) ~= 'table' or type(dest.x) ~= 'number' then return end
+    local cellKey = actors.cellKeyOfObj(obj)
+    if not cellKey then return end
+    if not actors.isHolderOf(cellKey) then
+        if initial == true and not talkingTo(obj) then return end
+        if appliedTravel[refKeyOf(obj)] == travelKeyOf(dest.x, dest.y, dest.z) then return end
+    end
+    local body = withAddr({
+        cellKey = cellKey, epoch = actors.epochOf(cellKey) or 0,
+        travel ={ x = dest.x, y = dest.y or 0, z = dest.z or 0 },
+    }, obj)
+    if body then mp.sendEvent('ActorAI', body) end
+end
+
+-- SCRIPTED TELEPORT (backlog 216). "PositionCell" from a player-gated script (GetDistance
+-- Player, OnActivate, a dialogue result) moved an AI-off puppet on this client; the holder's
+-- real actor never moved -- Dagoth Ur stayed out of the Heart chamber on the peer, Mehra never
+-- reached the Ghostgate for the guest. The engine notes the move (mwmp/puppets.hpp) under the
+-- cell the actor is LEAVING, the one somebody holds; the holder teleports the real one. The
+-- holder itself says nothing: its move is the authoritative one and streams out as a pose.
+-- 1.7.1: a SETTLING move (count 0: SetPos runs, a script's per-frame Move/MoveWorld) is held
+-- per actor and sent once it has not moved for POSITION_SETTLE_S -- the server allows five
+-- position claims a minute, and a script walking an NPC a frame at a time would spend them in
+-- a tenth of a second and then lose the move that mattered: where it stopped. The cell key of
+-- the FIRST held note is kept (the cell somebody holds); position and facing are the latest.
+local POSITION_SETTLE_S = 0.5
+actors.settlingMoves = {} -- obj.id -> { obj, cellName, pos, at }
+function actors.notePosition(obj, cellName, pos, now)
+    if not (obj and obj:isValid()) or type(pos) ~= 'table' or type(pos.x) ~= 'number' then return end
+    if pos.count == 0 and now == nil then
+        local held = actors.settlingMoves[obj.id]
+        local first = held and held.pos.cellKey or pos.cellKey
+        actors.settlingMoves[obj.id] = { obj = obj, cellName = cellName,
+            pos = { x = pos.x, y = pos.y, z = pos.z, rotZ = pos.rotZ, cellKey = first }, at = core.getRealTime() }
+        return
+    end
+    local cellKey = type(pos.cellKey) == 'string' and pos.cellKey ~= '' and pos.cellKey or actors.cellKeyOfObj(obj)
+    if not cellKey or actors.isHolderOf(cellKey) then return end
+    local body = withAddr({
+        cellKey = cellKey, epoch = actors.epochOf(cellKey) or 0,
+        position = { cell = tostring(cellName or ''), x = pos.x, y = pos.y or 0, z = pos.z or 0,
+            rotZ = type(pos.rotZ) == 'number' and pos.rotZ or nil },
+    }, obj)
+    if body then mp.sendEvent('ActorAI', body) end
+end
+
+function actors.flushSettlingMoves(now)
+    for id, m in pairs(actors.settlingMoves) do
+        if now - m.at >= POSITION_SETTLE_S then
+            actors.settlingMoves[id] = nil
+            actors.notePosition(m.obj, m.cellName, m.pos, now)
+        end
+    end
+end
+
+-- SCRIPTED SAY (backlog 217). "Say" from a script the peer runs (Dagoth Ur's lines) played to
+-- the peer's headless engine and nobody else. The engine notes it (mwscript OpSay -> ScriptNote
+-- 'say', file as recordId, subtitle as cellName); the holder relays, puppets play the line.
+function actors.noteSay(n)
+    local obj = n.ref
+    local cellKey = type(n.cellKey) == 'string' and n.cellKey ~= '' and n.cellKey or nil
+    if not (obj and obj:isValid() and cellKey and held[cellKey] and type(n.recordId) == 'string') then return end
+    local body = withAddr({ cellKey = cellKey, epoch = held[cellKey].epoch, file = n.recordId, text = n.cellName }, obj)
+    if body then mp.sendEvent('ActorSay', body) end
+end
+
+-- AI PACKAGE DONE (backlog 221). GetAiPackageDone reads a one-frame flag the AI sets when
+-- its top package finishes; a puppet's AI never runs, so a client-side poller (Fargoth's
+-- lookout, HentusTravel) waited forever. The holder's engine notes the completion; the flag
+-- is written onto the puppet, sticky until its AI resumes.
+function actors.noteAiDone(n)
+    local obj = n.ref
+    local cellKey = type(n.cellKey) == 'string' and n.cellKey ~= '' and n.cellKey or nil
+    if not (obj and obj:isValid() and cellKey and held[cellKey]) then return end
+    local body = withAddr({ cellKey = cellKey, epoch = held[cellKey].epoch, done = true }, obj)
+    if body then mp.sendEvent('ActorAI', body) end
+end
+
+-- A WITNESS PICKED A FIGHT OVER A CRIME (backlog 146). Theft and trespass are judged on the
+-- thief's client, where the victim is an AI-off puppet: commitCrime started combat on a body
+-- that never executes it, so a Fight-70 NPC that would attack a thief just barked. Claimed to
+-- the holder like a taunt's combat result; the server admits it because it names ourselves.
+-- `pursue`: a guard that would ARREST (AiPursue) rather than fight -- a small crime's chase.
+function actors.noteCrimeCombat(n, pursue)
+    local obj = n.ref
+    local cellKey = type(n.cellKey) == 'string' and n.cellKey ~= '' and n.cellKey or nil
+    local me = deps and deps.ownIdFn and deps.ownIdFn()
+    if not (obj and obj:isValid() and cellKey and me) or held[cellKey] then return end
+    local body = withAddr({ cellKey = cellKey, epoch = actors.epochOf(cellKey) or 0, combat = me, crime = true,
+        pursue = pursue == true or nil }, obj)
+    if body then mp.sendEvent('ActorAI', body) end
+end
+
+actors.handlers.MP_ActorSay = function(data)
+    local obj = actorOf(data)
+    if not obj or not puppetActors[refKeyOf(obj)] or type(data.file) ~= 'string' then return end
+    pcall(core.sound.say, data.file, obj, type(data.text) == 'string' and data.text or nil)
+end
+
+local function aimAt(obj, target, escort)
+    if mp.isSystem and mp.isSystem() then
+        local okd, d = pcall(function() return (obj.position - target.position):length() end)
+        print(string.format('[mp] aimAt %s -> %s at %.0f u (escort=%s)', tostring(obj.recordId), tostring(target.recordId),
+            okd and d or -1, tostring(type(escort) == 'table')))
+    end
+    if type(escort) == 'table' and type(escort.x) == 'number' then
+        pcall(function()
+            obj:sendEvent('StartAIPackage', { type = 'Escort', target = target,
+                destPosition = util.vector3(escort.x, escort.y or 0, escort.z or 0),
+                duration = escort.duration or 0 })
+        end)
+    else
+        pcall(function() obj:sendEvent('StartAIPackage', { type = 'Follow', target = target }) end)
+    end
 end
 
 -- ...and the receiving half. The target is resolved LOCALLY: the player who recruited them
 -- gets their own avatar, everyone else gets the puppet standing in for that person. Applied
 -- by sending the actor a StartAIPackage event, because AI packages can only be started from
 -- the actor's own local script -- the same asymmetry that made this a client gap.
+-- playerId -> { refKey -> actor }. Companions of each player, as told by MP_ActorAI. The
+-- engine carries a follower through a door only when it follows a PLAYER; on the peer the
+-- target is an avatar (an NPC), so the follower would stop at the door and the player would
+-- walk on alone. global.lua's MP_PlayerCellChange moves these along with the avatar.
+local followersOf = {}
+
+function actors.followersOf(playerId)
+    return followersOf[playerId] or {}
+end
+
+-- The avatar body is REPLACED on a resurrect or an appearance change, and removed when the
+-- player leaves; a Follow package aimed at the old object never finishes and the follower
+-- stands still for good. Re-aim it at the new body, or release it when there is none.
+function actors.refollow(playerId, target)
+    for _, f in pairs(followersOf[playerId] or {}) do
+        local obj = f.obj
+        if obj:isValid() then
+            if target then
+                aimAt(obj, target, f.escort)
+            else
+                pcall(function() obj:sendEvent('RemoveAIPackages', 'Follow') end)
+                pcall(function() obj:sendEvent('RemoveAIPackages', 'Escort') end)
+            end
+        end
+    end
+end
+
+function actors.forgetFollowers(playerId)
+    followersOf[playerId] = nil
+end
+
 actors.handlers.MP_ActorAI = function(data)
-    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    local obj = actorOf(data)
     if not obj then return end
+    if type(data.position) == 'table' and type(data.position.x) == 'number' then
+        -- A scripted teleport from a non-holder (notePosition); the server sends it to the
+        -- holder only. An empty cell name is the default exterior, resolved from x,y.
+        local p = data.position
+        local opts = type(p.rotZ) == 'number' and { rotation = util.transform.rotateZ(p.rotZ) } or nil
+        retry.teleport(obj, tostring(p.cell or ''), util.vector3(p.x, p.y or 0, p.z or 0), nil, opts)
+        return
+    end
+    if data.done == true then
+        if puppetActors[refKeyOf(obj)] and mp.setAiPackageDone then pcall(mp.setAiPackageDone, obj) end
+        return
+    end
+    if data.hold ~= nil then
+        -- #77: someone is talking to this NPC. The server sends it to the holder only; a
+        -- puppet's AI is off anyway. companion.lua parks it and lets it go.
+        if not puppetActors[refKeyOf(obj)] then
+            -- FACE THE ONE TALKING. In single player the engine turns an NPC to the player on its
+            -- greeting (actors.cpp updateGreetingState); here its "player" is the peer's dummy,
+            -- so it kept its back to whoever spoke to it. Turned once, in place, toward their body.
+            local body = data.hold == true and data.by ~= nil and deps.playerObjOf and deps.playerObjOf(data.by) or nil
+            if body and body:isValid() then
+                local okT, cellArg, pos, yaw = pcall(function()
+                    local d = body.position - obj.position
+                    local len = math.sqrt(d.x * d.x + d.y * d.y)
+                    if len < 1 then return nil end
+                    -- yaw from +Y toward +X; acos, not atan2: the peer is LuaJIT, the browser 5.4
+                    local yaw = math.acos(math.max(-1, math.min(1, d.y / len))) * (d.x < 0 and -1 or 1)
+                    return obj.cell and not obj.cell.isExterior and obj.cell.name or '', obj.position, yaw
+                end)
+                if okT and cellArg then
+                    retry.teleport(obj, cellArg, pos, nil, { rotation = util.transform.rotateZ(yaw), onGround = true })
+                end
+            end
+            pcall(function() obj:sendEvent('MP_DialogueHold', { on = data.hold == true }) end)
+        end
+        return
+    end
+    if type(data.travel) == 'table' and type(data.travel.x) == 'number' then
+        -- A scripted destination. On a puppet (AI off) it is state only; on the holder the
+        -- actor walks there, which is the point.
+        appliedTravel[refKeyOf(obj)] = travelKeyOf(data.travel.x, data.travel.y, data.travel.z)
+        pcall(function()
+            obj:sendEvent('StartAIPackage', { type = 'Travel',
+                destPosition = util.vector3(data.travel.x, data.travel.y or 0, data.travel.z or 0) })
+        end)
+        return
+    end
+    if data.combat ~= nil then
+        -- The holder says this actor is (or stopped) fighting a player. Stacked on the puppet
+        -- with its AI off it never executes; it only makes the state readable. On MP_Detach
+        -- the AI resumes with the fight it was actually in, which is right.
+        local foe = data.combat and deps.playerObjOf and deps.playerObjOf(data.combat) or nil
+        if foe then
+            -- `pursue`: a guard's arrest chase for a small crime, not a fight.
+            local pursue = data.pursue == true
+            pcall(function() obj:sendEvent('StartAIPackage', { type = pursue and 'Pursue' or 'Combat', target = foe }) end)
+            -- The provoking shout (#227): AiCombat rolls iVoiceAttackOdds per swing on the
+            -- holder, whose engine is headless; rolled once here, at the fight's start.
+            if not pursue and puppetActors[refKeyOf(obj)] and mp.say then
+                pcall(function()
+                    if math.random(0, 99) < (tonumber(core.getGMST('iVoiceAttackOdds')) or 0) then mp.say(obj, 'attack') end
+                end)
+            end
+        else
+            pcall(function() obj:sendEvent('RemoveAIPackages', 'Combat') end)
+        end
+        return
+    end
+    local key = refKeyOf(obj)
+    for _, list in pairs(followersOf) do list[key] = nil end
+    if data.follow ~= nil then
+        followersOf[data.follow] = followersOf[data.follow] or {}
+        followersOf[data.follow][key] = { obj = obj, escort = data.escort }
+    end
     local target = deps.playerObjOf and deps.playerObjOf(data.follow) or nil
+    if mp.isSystem and mp.isSystem() then
+        print(string.format('[mp] follow claim: %s -> player %s target=%s holder=%s', tostring(obj.recordId),
+            tostring(data.follow), target and 'yes' or 'NO', tostring(actors.isHolderOf(actors.cellKeyOfObj(obj)))))
+    end
     if target then
-        pcall(function() obj:sendEvent('StartAIPackage', { type = 'Follow', target = target }) end)
+        aimAt(obj, target, data.escort)
     else
         -- Only Follow is removed, never the whole stack: clearing everything would also cancel
         -- the combat and wander packages that make the actor an actor.
         pcall(function() obj:sendEvent('RemoveAIPackages', 'Follow') end)
+        pcall(function() obj:sendEvent('RemoveAIPackages', 'Escort') end)
     end
 end
 
 actors.handlers.MP_ActorEquip = function(data)
-    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    local obj = actorOf(data)
     if obj and puppetActors[refKeyOf(obj)] then
         pcall(function() obj:sendEvent('MP_Equip', { slots = data.slots or {} }) end)
     end
@@ -473,9 +1104,8 @@ end
 -- payday, and without this an infinite-respawn world mints artifacts forever. Applied by
 -- every client in the cell (an event, not a per-player view), so nobody can decline it.
 actors.handlers.MP_ActorStripLoot = function(data)
-    local obj = data.ref
-    local okValid, valid = pcall(function() return obj:isValid() end)
-    if not (okValid and valid) then return end
+    local obj = actorOf(data)
+    if not obj then return end
     pcall(function()
         for _, item in ipairs(types.Actor.inventory(obj):getAll()) do
             if item:isValid() then item:remove() end
@@ -484,10 +1114,21 @@ actors.handlers.MP_ActorStripLoot = function(data)
 end
 
 actors.handlers.MP_ActorDeath = function(data)
-    local obj = data.ref and data.ref:isValid() and data.ref or nil
+    local obj = actorOf(data)
     if obj and puppetActors[refKeyOf(obj)] then
         pcall(function() obj:sendEvent('MP_Kill', {}) end)
     end
+    -- The one we were talking to (quests.lua closes the window, backlog 228).
+    if obj and deps.actorDeathFn then pcall(deps.actorDeathFn, obj) end
+end
+
+-- The inverse of ActorDeath (#293): the holder's copy came back to life (scripted
+-- Resurrect). mp.resurrect(obj) is the engine's own revive; the puppet drops its dead latch.
+actors.handlers.MP_ActorRevive = function(data)
+    local obj = actorOf(data)
+    if not obj then return end
+    pcall(mp.resurrect, obj)
+    if puppetActors[refKeyOf(obj)] then pcall(function() obj:sendEvent('MP_Revive', {}) end) end
 end
 
 -- Server-authoritative kill tallies, re-asserted every mirror tick.
@@ -510,10 +1151,90 @@ end
 
 -- Test hook (holder side): damage a specific cell NPC to death so the death edge, the
 -- ActorDeath relay and the shared kill tally can be asserted end to end.
+-- WorldCellState names every actor recorded dead in this cell. A puppet already here dies
+-- now; one puppeted later dies on registration (above). Keyed by refKey, like the relay.
+-- In a cell we HOLD the body dies for real (the peer loads vanilla after a restart).
+-- The wire names an actor "c:<index>:<contentFile>" or "n:<netId>" (proto/ref.ts); the
+-- puppet table is keyed by the local object id (refKeyOf). Resolve first -- looked up raw,
+-- the wire key matched nothing and every recorded death was a no-op.
+local function objOfWireKey(key)
+    local netId = key:match('^n:(%d+)$')
+    if netId then return deps.objOfNet and deps.objOfNet(tonumber(netId)) end
+    local index, cf = key:match('^c:(%d+):(%d+)$')
+    if not index then return nil end
+    local contentName = core.contentFiles.list[tonumber(cf) + 1]
+    if not contentName then return nil end
+    local ok, obj = pcall(function() return world.getObjectByFormId(core.getFormId(contentName, tonumber(index))) end)
+    return ok and obj or nil
+end
+
+-- HOLDER RETRY (s157 #187: eldafire came back alive on the restarted peer while every screen
+-- showed her corpse). The record is answered ONCE per held cell and a key that does not resolve
+-- in that frame was dropped ("the next WorldCellState says it again" -- never true for a holder:
+-- nothing re-sends it) while `recorded` opened the bars anyway. A held cell now keeps its unkilled
+-- keys and retries each tick for DEATH_RETRY_SECONDS. Bounded: a scripted Resurrect after that
+-- must not be undone by a stale list.
+local DEATH_RETRY_SECONDS = 30
+local function killRecorded(cell, now)
+    local left = {}
+    for _, wireKey in ipairs(cell.deathKeys or {}) do
+        local obj = objOfWireKey(wireKey)
+        local okv, valid = pcall(function() return obj and obj:isValid() end)
+        if okv and valid then
+            local okd, dead = pcall(types.Actor.isDead, obj) -- a key that names a non-actor must not abort the holder tick
+            if okd and not dead then
+                if not obj:hasScript('scripts/mp/testkill.lua') then pcall(function() obj:addScript('scripts/mp/testkill.lua', {}) end) end
+                left[#left + 1] = wireKey -- until it reads dead
+            end
+        else
+            left[#left + 1] = wireKey
+        end
+    end
+    cell.deathKeys = (#left > 0 and now < (cell.deathUntil or 0)) and left or nil
+    if #left > 0 and not cell.deathKeys then print('[mp] recorded deaths never applied in ' .. tostring(cell.cellKey) .. ': ' .. table.concat(left, ',')) end
+end
+
+function actors.noteCellDeaths(cellKey, keys)
+    -- The record answered the request broadcastCell sent once the cell had actors (#431):
+    -- from here the holder's bars can go out. The grant's own request may be answered before
+    -- the cell is loaded, when no key below resolves; that answer does not count.
+    if held[cellKey] and held[cellKey].resynced then held[cellKey].recorded = true end
+    if held[cellKey] and keys and #keys > 0 then
+        local h = held[cellKey]
+        h.cellKey, h.deathKeys, h.deathUntil = cellKey, keys, core.getRealTime() + DEATH_RETRY_SECONDS
+    end
+    for _, wireKey in ipairs(keys or {}) do
+        local obj = objOfWireKey(wireKey)
+        local okv, valid = pcall(function() return obj and obj:isValid() end)
+        if not (okv and valid) then
+            -- Not loaded here yet: nothing to key on. A held cell retries it (killRecorded);
+            -- a viewer waits for its next WorldCellState.
+        else
+            local key = refKeyOf(obj)
+            if held[cellKey] then
+                -- We simulate this cell: the body dies for real, in its own Self context
+                -- (dynamic stats are Self-gated; testkill.lua is exactly that one write).
+                if not types.Actor.isDead(obj) then pcall(function() obj:addScript('scripts/mp/testkill.lua', {}) end) end
+            elseif puppetActors[key] then
+                pcall(function() obj:sendEvent('MP_Kill', {}) end)
+            else
+                pendingDeaths[key] = true
+            end
+        end
+    end
+end
+
 function actors.killActorByRecord(recordId)
     watchKillRecord = recordId
     for _, obj in ipairs(cellActors(deps.ownCellKeyFn())) do
-        if obj.recordId == recordId then
+        -- NOT A CORPSE, NOT ONE ALREADY DYING: the first match was always the same fish (the
+        -- dead stay in the cell's list, and a kill lands at the END of the frame), so four
+        -- kills killed one and the rest bit on (#158 s149).
+        local okL, alive = pcall(function()
+            return not types.Actor.isDead(obj) and types.Actor.stats.dynamic.health(obj).current > 0
+                and not obj:hasScript('scripts/mp/testkill.lua')
+        end)
+        if obj.recordId == recordId and okL and alive then
             -- Dynamic-stat writes are Self-gated: setting health from here silently fails
             -- (a pcall around it just hides the error). Attach a one-shot CUSTOM script to
             -- reach the actor's own Self context instead.
@@ -532,7 +1253,10 @@ function actors.snapActor(actorKey, pos)
     local obj = resolveRefKey(actorKey)
     if obj and obj:isValid() then
         local cellArg = obj.cell and not obj.cell.isExterior and obj.cell.name or ''
-        pcall(function() obj:teleport(cellArg, util.vector3(pos.x, pos.y, pos.z)) end)
+        -- WITH ITS FACING. A snap that kept the old yaw left the body inside the 64 u gate,
+        -- walking the new way while turned round (1% of walking NPCs on prod, 2026-10-23).
+        local opts = type(pos.yaw) == 'number' and { rotation = util.transform.rotateZ(pos.yaw) } or nil
+        retry.teleport(obj, cellArg, util.vector3(pos.x, pos.y, pos.z), nil, opts)
     end
 end
 
@@ -552,13 +1276,62 @@ function actors.isHolderOf(cellKey)
     return cellKey ~= nil and held[cellKey] ~= nil
 end
 
+-- Backlog 142: disposition and equipment go out on change only, so a player entering a
+-- cell we hold never heard the persuasion that happened before they arrived (and their
+-- next persuasion overwrote it). Forget the last-sent values for that cell; the next tick
+-- re-sends every actor's current state to the room.
+function actors.catchUpCell(cellKey)
+    local cell = cellKey and held[cellKey]
+    if not cell then return end
+    for _, tracked in pairs(cell.actors) do
+        tracked.dispVal, tracked.equipFp = nil, nil
+    end
+end
+
+-- Phase 4C: does ANYONE simulate this cell right now (the peer, in the one-peer model)?
+-- Distinct from isHolderOf ("do I"). combat.lua asks this to decide whether a real melee
+-- hit is forwarded (nobody simulating: degraded relay) or left to the avatar's own swing.
+-- Does ANY cell we know of have a simulator? The first ActorAuthorityInfo of a session says
+-- "this world is peer-simulated"; used to keep local runtime spawns off from then on.
+function actors.anyHolder()
+    return next(held) ~= nil or next(holderOfCell) ~= nil
+end
+
+function actors.hasHolder(cellKey)
+    return cellKey ~= nil and (held[cellKey] ~= nil or holderOfCell[cellKey] ~= nil)
+end
+
 function actors.cellKeyOfObj(obj)
     return cellKeyOf(obj.cell)
 end
 
+-- The cells this process holds, resolved (objects.lua polls their doors, #289).
+function actors.heldCells()
+    local out = {}
+    for key in pairs(held) do
+        local x, y = key:match('^(-?%d+),(-?%d+)$')
+        local ok, c
+        if x then ok, c = pcall(world.getExteriorCell, tonumber(x), tonumber(y))
+        else ok, c = pcall(world.getCellByName, key) end
+        if ok and c then out[#out + 1] = c end
+    end
+    return out
+end
+
 -- --------------------------------------------------------------- tick
 
+-- The cell an actor's puppet belongs to: where MP_ActorCellChange sent it while that move is
+-- this frame's or the last, or still queued in retry.lua; otherwise where it stands.
+function actors.cellKeyFor(key, obj)
+    local m = movedTo[key]
+    if m and (frameNo - m.frame <= 1 or retry.pendingTeleport(obj)) then return m.cellKey end
+    movedTo[key] = nil
+    return cellKeyOf(obj.cell)
+end
+
 function actors.tick(now)
+    actors.flushSettlingMoves(now)
+    frameNo = frameNo + 1
     -- Non-holder: keep trying to puppet our cell's actors. Attaching ONLY on
     -- MP_ActorAuthorityInfo loses the race — that event lands on our PlayerCellChange,
     -- while the cell's actors are still streaming in, so cellActors() is empty or partial
@@ -584,8 +1357,10 @@ function actors.tick(now)
     -- peer's 50ms frames only cleared every SECOND frame, so a "15 Hz" stream was really 10 Hz,
     -- and the interpolator's 100ms render delay had no jitter margin left at that spacing.
     -- One knob, on the server, instead of two that alias against each other.
+    local byCell = next(held) and actorsByCell() or nil
     for cellKey, cell in pairs(held) do
-        broadcastCell(cellKey, cell.epoch, cell, now)
+        if cell.deathKeys then killRecorded(cell, now) end
+        broadcastCell(cellKey, cell.epoch, cell, now, byCell[cellKey] or {})
     end
     if now - lastSnapshot >= SNAPSHOT_SECONDS then
         lastSnapshot = now
@@ -603,9 +1378,9 @@ function actors.tick(now)
         local ownCell = deps.ownCellKeyFn()
         -- Ids arrive over LSER as doubles: format as integers so "1" never reads as "1.0".
         local holderId = holderOfCell[ownCell]
-        mp.testSet('authorityHolder', holderId and string.format('%.0f', holderId) or 'none')
-        mp.testSet('isHolder', tostring(held[ownCell] ~= nil))
-        mp.testSet('actorCount', tostring(#cellActors(ownCell)))
+        mp.set('authorityHolder', holderId and string.format('%.0f', holderId) or 'none')
+        mp.set('isHolder', tostring(held[ownCell] ~= nil))
+        mp.set('actorCount', tostring(#cellActors(ownCell)))
         -- Diagnostic: unfiltered active-actor census (distinguishes "filter too strict" from
         -- "content ships no actors"; the clean Example Suite ships none).
         local raw, census = 0, {}
@@ -615,26 +1390,61 @@ function actors.tick(now)
                 or (deps.isMpPuppetFn(obj) and 'mppuppet' or 'npc')
             census[#census + 1] = tag .. '@' .. tostring(cellKeyOf(obj.cell))
         end
-        mp.testSet('activeActorsRaw', tostring(raw))
-        mp.testSet('actorCensus', json.encode(census))
+        mp.set('activeActorsRaw', tostring(raw))
+        mp.set('actorCensus', json.encode(census))
         local puppeted = 0
         for _ in pairs(puppetActors) do puppeted = puppeted + 1 end
-        mp.testSet('puppetedActors', tostring(puppeted))
-        mp.testSet('actorBatchesIn', tostring(batchesIn))
+        mp.set('puppetedActors', tostring(puppeted))
+        mp.set('actorBatchesIn', tostring(batchesIn))
         -- Deterministic cross-client actor probe: world.activeActors is in engine-internal
         -- order, which differs per client, so key by recordId and sort. Scenarios compare
         -- the SAME record on both clients.
-        local probe = {}
+        local probe, probeN = {}, {}
+        -- far: past the engine's actor processing range (7168 u, the default) from us, where a
+        -- puppet is hidden and frozen by the engine itself (actors.cpp) -- nothing anyone sees,
+        -- so the page's NPC path/facing/no-pose telemetry leaves it out.
+        local me = world.players[1]
+        local mePos = me and me:isValid() and me.position
         for _, obj in ipairs(cellActors(ownCell)) do
             local rec = obj.recordId
+            -- n: how many of this record stand in the cell. First-wins by record means two
+            -- clients can be looking at DIFFERENT fish (s42 #117: slaughterfish_small 4859 u
+            -- apart); a scenario compares records with n == 1 only.
+            if probe[rec] then probe[rec].n = probe[rec].n + 1 end
+            -- THE BODY THE HOLDER DRIVES, over a local-only twin of the same record: a twin
+            -- stands still where the content placed it, and a scenario swung at it 150 u from
+            -- the real NPC for a hundred swings (s157 #166: client 60 u, peer 153-213 u).
+            local puppeted = actors.isPuppetedActor(obj) == true
+            if probe[rec] and puppeted and not probe[rec].puppet then
+                local n = probe[rec].n
+                probe[rec] = nil
+                probeN[rec] = n
+            end
             if not probe[rec] then
                 local p = obj.position
-                probe[rec] = { x = p.x, y = p.y, z = p.z, dead = types.Actor.isDead(obj) }
+                -- `guard` so a scenario can find the actor that is supposed to REACT to a
+                -- bounty. Class is not otherwise visible from the harness, and "walks toward
+                -- you when you are wanted" is only meaningful about a guard.
+                local isGuard = false
+                pcall(function() isGuard = types.NPC.record(obj).class == 'guard' end)
+                -- hp is the HOLDER's view once mirrored (MP_Stats): a corpse the simulator
+                -- reloaded alive reads dead here with hp climbing back up (s157).
+                local hp = -1
+                pcall(function() hp = types.Actor.stats.dynamic.health(obj).current end)
+                -- yaw: the drawn facing, which the page compares with the server's for the same
+                -- NPC (telemetry npcFacing) -- "they do 180s as they walk" was invisible in
+                -- every position metric (prod 2026-10-14).
+                -- id/net: WHICH stream is this body's -- the page matches it to its own poses
+                -- (telemetry npcPath), not to whichever actor happens to stand nearest.
+                probe[rec] = { x = p.x, y = p.y, z = p.z, yaw = obj.rotation:getYaw(), dead = types.Actor.isDead(obj),
+                    guard = isGuard, hp = hp, n = probeN[rec] or 1, puppet = puppeted,
+                    id = obj.id, net = deps.netIdOf and deps.netIdOf(obj) or nil,
+                    far = mePos and ((p.x - mePos.x) ^ 2 + (p.y - mePos.y) ^ 2) > 7168 * 7168 or nil }
             end
         end
-        mp.testSet('actorProbe', json.encode(probe))
+        mp.set('actorProbe', json.encode(probe))
         if watchKillRecord then
-            mp.testSet('killCountOf',
+            mp.set('killCountOf',
                 watchKillRecord .. '=' .. string.format('%.0f', mp.getDeadCount(watchKillRecord)))
         end
     end

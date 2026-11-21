@@ -13,9 +13,12 @@ local types = require('openmw.types')
 local util = require('openmw.util')
 local world = require('openmw.world')
 local mp = require('openmw.mp')
+local I = require('openmw.interfaces')
 
 local json = require('scripts.mp.json')
 local worldmp = require('scripts.mp.world')
+-- remove/teleport that survive an in-flight teleport (count 0 until the end of the frame)
+local retry = require('scripts.mp.retry')
 
 local objects = {}
 
@@ -25,6 +28,10 @@ local deps = nil
 local DROP_DETECT_RANGE = 600 -- only the dropper relays (someone must own the spawn)
 local CONTAINER_WATCH_SECONDS = 15 -- native container UI has no close signal; poll window
 local CONTAINER_POLL = 0.25
+-- Frames counted by objects.tick. A network apply lands on the next delayed-actions pass, so
+-- three frames on, whatever differs from what was applied is the player's own doing (s175).
+local frameNo = 0
+local EXPECT_FRAMES = 3
 local LOCK_WATCH_SECONDS = 4
 local DOOR_READ_DELAY = 0.4 -- door starts turning on activation; read the resulting state
 -- Containers get the same treatment for a sharper reason. Morrowind resolves a container's
@@ -36,7 +43,16 @@ local DOOR_READ_DELAY = 0.4 -- door starts turning on activation; read the resul
 -- Reported as a plant that opens blank and stays blank. Read it a beat later instead.
 local CONTAINER_OPEN_DELAY = 0.2
 local ECHO_GUARD_SECONDS = 5
+local peerRules = false -- objects.setPeerRules
 
+local AMMO = { [types.Weapon.TYPE.Arrow] = true, [types.Weapon.TYPE.Bolt] = true, [types.Weapon.TYPE.MarksmanThrown] = true }
+local function isAmmo(obj)
+    local ok, t = pcall(function() return types.Weapon.record(obj).type end)
+    return ok and AMMO[t] == true
+end
+
+local netActorCount = 0 -- runtime actors built here from the holder's naming (mirror: netActors)
+local recentTakes = {} -- netId -> realTime of our granted take (its delete echo is ours)
 local netToObj = {} -- netId -> GameObject
 local objIdToNet = {} -- obj.id (string) -> netId
 local netSpawned = {} -- obj.id -> true (objects created FROM the network or net-acked)
@@ -44,6 +60,7 @@ local pendingSpawns = {} -- tempId -> GameObject (local drop awaiting ObjectSpaw
 local tempCounter = 0
 local opCounter = 0
 local pendingOps = {} -- opId -> {op=, itemId=, n=, key=, obj=}
+local pendingTakes = {} -- opId -> {obj=, at=}: pickups awaiting the server's answer
 local recentPickups = {} -- obj.id -> time (belt+braces beside the byId echo skip)
 local doorPending = {} -- obj.id -> {obj=, at=}
 local containerOpenPending = {} -- obj.id -> {obj=, at=}: deferred first read, see above
@@ -56,6 +73,9 @@ local openRetries = {} -- obj.id -> attempts so far
 -- just rewritten by a canonical ContainerState. Retried rather than applied once, because the
 -- recreated items do not exist until a later frame.
 local equipPending = {}
+-- Containers whose rewrite is not finished (adds in flight): rerun next frame (backlog R5).
+local containerRedo = {}
+local reconcile = require('scripts.mp.reconcile') -- global context only (see run.lua)
 local EQUIP_RESTORE_WINDOW = 3.0 -- give up after this; a permanent retry would leak the entry
 local lockWatch = {} -- obj.id -> {obj=, locked=, level=, until_=}
 -- Phase 4: obj.id -> last seen `enabled`. Unlike locks, an enable/disable is not tied to
@@ -63,6 +83,14 @@ local lockWatch = {} -- obj.id -> {obj=, locked=, level=, until_=}
 -- of the player's own cell rather than a watch window. Entries double as the echo mute:
 -- a network apply writes the new value here before touching the object.
 local enableWatch = {}
+-- Same poll, for locks a SCRIPT sets (a quest unlocking a door, a trap re-locking a chest):
+-- lockWatch only watches for 4 s after an activation, and a Lock with nobody touching the
+-- object was never seen. obj.id -> lock level (false = unlocked); doubles as the echo mute.
+local scriptLockWatch = {}
+-- Same poll, on the PEER only, for doors its NPCs open: a guard walking through a door
+-- relays nothing (only the activating player does), so the puppet hit a shut door and
+-- snapped through (#289). obj.id -> open (boolean); doubles as the echo mute.
+local doorStateWatch = {}
 local nextEnablePoll = 0
 local ENABLE_POLL = 1.0 -- seconds; a reveal appearing within a second reads as instant
 local containerWatch = {} -- obj.id -> {obj=, last={id->n}, nextPoll=, until_=}
@@ -100,7 +128,7 @@ local function dropOut(what, why, detail)
     local now = core.getRealTime()
     if dropOutAt[key] and now - dropOutAt[key] < DROP_OUT_EVERY then return end
     dropOutAt[key] = now
-    pcall(function() mp.testSet('lastDropOut', key) end)
+    pcall(function() mp.set('lastDropOut', key) end)
     print(string.format('[mp] OUTBOUND DROPPED: %s why=%s%s', what, why,
         detail and (' ' .. tostring(detail)) or ''))
 end
@@ -110,6 +138,17 @@ local function addrOf(obj)
     if netId then return { net = netId } end
     if obj.contentFile then return { ref = obj } end
     return nil
+end
+
+-- The teleport cell for a placement the server names: ITS cell, not ours. The peer holds many
+-- cells from one parked dummy, and a client that just took a door still gets the old cell's
+-- late updates; with our own cell, those items landed in the wrong room at the right coords.
+local function cellArgFor(cellKey)
+    if type(cellKey) == 'string' and cellKey ~= '' then
+        return cellKey:match('^%-?%d+,%-?%d+$') and '' or cellKey
+    end
+    local player = deps.playerFn()
+    return (player and player.cell and not player.cell.isExterior) and player.cell.name or ''
 end
 
 local function resolveBody(data)
@@ -138,6 +177,17 @@ local function resolveRefKey(key)
     return nil
 end
 
+-- A CARRIED ITEM IS NOT THE WORLD OBJECT IT WAS. A single picked-up item keeps the form id of
+-- the world reference it came from, so a cell state's refKey for that pickup resolves to the
+-- copy in the player's pack. Deleting or moving it there took the item out of the inventory
+-- on the next cell entry once the 5 s pickup guard had lapsed, and the next declaration saved
+-- the loss -- an equipped weapon was simply gone (prod 2026-10-29/30, iron shardaxe, twice).
+-- The cell state only ever describes objects lying in the world.
+local function inWorld(obj)
+    local ok, parent = pcall(function() return obj.parentContainer end)
+    return not (ok and parent ~= nil)
+end
+
 local function cellKeyOfObj(obj)
     local cell = obj.cell
     if not cell then return deps.ownCellKeyFn() end
@@ -152,8 +202,10 @@ end
 -- same world ("the papers never appear"). Nothing in these cells is reported out either: a
 -- tutorial prop has no business in shared world state.
 local function isChargenCell(cellKey)
+    -- Exact names (backlog 385): a substring on 'census' made every Tamriel Rebuilt Census
+    -- and Excise office a sanctuary.
     local k = string.lower(tostring(cellKey or ''))
-    return (k:find('census', 1, true) ~= nil) or (k:find('prison ship', 1, true) ~= nil)
+    return k == 'seyda neen, census and excise office' or k == 'imperial prison ship'
 end
 
 local function sendAddressed(eventName, obj, extra)
@@ -221,13 +273,17 @@ local function snapshotContainer(obj, allowLive)
     return counts
 end
 
+-- WIRE FORM. A player-made record (potion, enchanted item) travels as the server's recordNetId,
+-- exactly as the drop path does (requestSpawn toNet / MP_ObjectPlace toLocal); content ids pass
+-- through. Before this a friend saw your potion as THEIR own local `Generated:` id, and restock
+-- re-added the bogus id forever.
 local function countsToItems(counts)
     local items = {}
     local ids = {}
     for id in pairs(counts) do ids[#ids + 1] = id end
     table.sort(ids)
     for _, id in ipairs(ids) do
-        if counts[id] > 0 then items[#items + 1] = { id = id, n = counts[id] } end
+        if counts[id] > 0 then items[#items + 1] = { id = worldmp.toNet(id), n = counts[id] } end
     end
     return items
 end
@@ -265,14 +321,23 @@ local function setContainerContents(obj, items)
             end
         end
     end
+    -- RECONCILE, NOT REWRITE. This used to remove everything and create the list afresh --
+    -- and a second canonical state in the same frame (a ContainerState and a WorldCellState on
+    -- cell entry, a resync) found the store empty, since the first rewrite's creates land at the
+    -- end of the frame, removed nothing and created the whole list again: the container
+    -- doubled. reconcile.lua brings the store to the list counting what is in flight, and a
+    -- pass that is not finished runs again next frame (objects.tick).
     pcall(function()
-        for _, item in ipairs(content:getAll()) do
-            item:remove()
-        end
+        local list = {}
         for _, entry in ipairs(items or {}) do
-            local okc, created = pcall(function() return world.createObject(entry.id, entry.n) end)
-            if okc then created:moveInto(content) end
+            list[#list + 1] = { id = worldmp.toLocal(entry.id), n = entry.n or 1 }
         end
+        local r = reconcile.reconcileInventory({
+            inventory = content, items = list, key = 'c:' .. tostring(obj.id), shed = true,
+            createObject = function(rid, n) return world.createObject(rid, n) end,
+        })
+        if r.pending then containerRedo[obj.id] = { obj = obj, items = items, gen = reconcile.generation() }
+        else containerRedo[obj.id] = nil end
     end)
     -- DEFERRED, not inline. createObject+moveInto lands a frame or more later, so calling
     -- setEquipment here finds an empty store and fails silently -- identity.lua hit exactly
@@ -280,14 +345,32 @@ local function setContainerContents(obj, items)
     if equipped and next(equipped) then
         equipPending[obj.id] = { obj = obj, slots = equipped, until_ = core.getRealTime() + EQUIP_RESTORE_WINDOW }
     end
-    -- Never re-diff a network apply as a local op.
+    -- Never re-diff a network apply as a local op -- and never against a HALF-APPLIED one.
+    -- item:remove() empties the store now, but createObject+moveInto lands on the next
+    -- delayed-actions pass, so a snapshot taken here is empty (chest) or the pre-canonical
+    -- stock (a live actor, where the non-live read returned nil and the old baseline stood).
+    -- Either way the next poll reported the difference as OUR put/take: loot doubled on every
+    -- second opener, and a friend's purchase deleted a matching item from our own pack. The
+    -- baseline is taken on the next poll instead, from the store as it really is.
     local watch = containerWatch[obj.id]
-    if watch then watch.last = snapshotContainer(obj) or watch.last end
+    if watch then
+        watch.last = nil; watch.rebase = true; watch.nextPoll = core.getRealTime() + CONTAINER_POLL
+        -- ...and WHAT the store will hold once it has: a put made between this apply and the
+        -- rebase poll used to be swallowed into the new baseline -- the item left the player's
+        -- pack and never reached the server's chest (s175).
+        local expect = {}
+        for _, entry in ipairs(items or {}) do
+            local id = worldmp.toLocal(entry.id)
+            expect[id] = (expect[id] or 0) + entry.n
+        end
+        watch.expect, watch.expectFrame = expect, frameNo + EXPECT_FRAMES
+    end
 end
 
 local function applyContainerDelta(obj, itemId, dn)
     local content = lootStore(obj, true)
     if not content then return end
+    itemId = worldmp.toLocal(itemId)
     pcall(function()
         if dn > 0 then
             local okc, created = pcall(function() return world.createObject(itemId, dn) end)
@@ -304,29 +387,124 @@ local function applyContainerDelta(obj, itemId, dn)
         end
     end)
     local watch = containerWatch[obj.id]
-    if watch then watch.last = snapshotContainer(obj) or watch.last end
+    if watch then
+        -- The expected store is the old baseline plus this delta; with no baseline there is
+        -- nothing to expect, and the plain rebase stands.
+        local expect = nil
+        if watch.last then
+            expect = {}
+            for id, n in pairs(watch.last) do expect[id] = n end
+            expect[itemId] = math.max(0, (expect[itemId] or 0) + dn)
+            if expect[itemId] == 0 then expect[itemId] = nil end
+        elseif watch.expect then
+            expect = watch.expect -- a delta on top of an apply still landing
+            expect[itemId] = math.max(0, (expect[itemId] or 0) + dn)
+            if expect[itemId] == 0 then expect[itemId] = nil end
+        end
+        watch.last = nil; watch.rebase = true; watch.nextPoll = core.getRealTime() + CONTAINER_POLL
+        watch.expect, watch.expectFrame = expect, expect and frameNo + EXPECT_FRAMES or nil
+    end
+end
+
+local function sameCounts(a, b)
+    for id, n in pairs(a) do if (b[id] or 0) ~= n then return false end end
+    for id, n in pairs(b) do if (a[id] or 0) ~= n then return false end end
+    return true
 end
 
 -- Diff a watched container against its last snapshot and report every change. Extracted so the
 -- expiry path can run it too: the watch window closing does not mean nothing happened inside it.
+-- What our own pack holds, by record. A take is the container going down AND the pack going up;
+-- a put the other way round. A container that changed while the pack did not was changed by
+-- someone else -- the server's canonical copy replacing this engine's own roll of a corpse --
+-- and reporting that as our take credited loot nobody held (prod 2026-10-15: the crab meat the
+-- holder's mudcrab never had, credited, then taken away again; s913).
+local MATCH_WINDOW_S = 1.5 -- how long one side of a pack<->container move may wait for the other
+local function packSnapshot()
+    local counts = {}
+    local player = deps.playerFn and deps.playerFn()
+    if not player then return counts end
+    pcall(function()
+        for _, item in ipairs(types.Actor.inventory(player):getAll()) do
+            counts[item.recordId] = (counts[item.recordId] or 0) + item.count
+        end
+    end)
+    return counts
+end
 local function diffContainer(obj, watch)
+    local pack = packSnapshot()
     local current = snapshotContainer(obj, watch.live)
     if not current then
         dropOut('ContainerOpRequest', 'contents-unreadable', tostring(obj.recordId))
         return
     end
-    local seen = {}
-    for recId, n in pairs(current) do
-        seen[recId] = true
-        local dn = n - (watch.last[recId] or 0)
-        if dn ~= 0 then objects.sendContainerOp(obj, dn < 0 and 'take' or 'put', recId, math.abs(dn)) end
+    if watch.rebase or watch.last == nil then
+        if watch.expect then
+            if sameCounts(current, watch.expect) then
+                -- The apply has landed and nothing else happened: this is the baseline.
+                watch.rebase, watch.expect, watch.expectFrame = nil, nil, nil
+                watch.last = current
+                watch.pack = pack
+                return
+            elseif frameNo < watch.expectFrame then
+                return -- still landing; look again next poll
+            end
+            -- Landed frames ago and the store still differs: the difference is the player's.
+            -- Diff against what was applied, below, instead of absorbing it.
+            watch.last = watch.expect
+            watch.rebase, watch.expect, watch.expectFrame = nil, nil, nil
+        else
+            -- The first read after a network apply: the store as it really is, now that the
+            -- deferred rewrite has landed. Nothing to report.
+            watch.rebase = nil
+            watch.last = current
+            watch.pack = pack
+            return
+        end
     end
-    for recId, n in pairs(watch.last) do
-        if not seen[recId] and n > 0 then
-            objects.sendContainerOp(obj, 'take', recId, n)
+    -- MATCHED ACROSS POLLS, NOT WITHIN ONE. A move between pack and container lands in two
+    -- frames: the source side changes at once, the destination at the end of the frame
+    -- (reconcile.lua's engine rule). A poll between the two saw the container change with no
+    -- pack change and threw a real put away (s31, first failure in 30 builds), or a real take.
+    -- So both sides accumulate per record and are matched as they land; what is still
+    -- unmatched after MATCH_WINDOW_S was not ours (a canonical correction) and is only said.
+    local prevPack = watch.pack or pack
+    local now = core.getRealTime()
+    local acc = watch.acc or {}
+    watch.acc = acc
+    local function add(recId, dc, dp)
+        if dc == 0 and dp == 0 then return end
+        local a = acc[recId] or { c = 0, p = 0, since = now }
+        a.c, a.p = a.c + dc, a.p + dp
+        acc[recId] = a
+    end
+    local recs = {}
+    for recId in pairs(current) do recs[recId] = true end
+    for recId in pairs(watch.last) do recs[recId] = true end
+    for recId in pairs(pack) do recs[recId] = true end
+    for recId in pairs(prevPack) do recs[recId] = true end
+    for recId in pairs(recs) do
+        add(recId, (current[recId] or 0) - (watch.last[recId] or 0), (pack[recId] or 0) - (prevPack[recId] or 0))
+    end
+    for recId, a in pairs(acc) do
+        local mine = 0
+        if a.c < 0 and a.p > 0 then mine = math.min(-a.c, a.p)
+        elseif a.c > 0 and a.p < 0 then mine = math.min(a.c, -a.p) end
+        if mine > 0 then
+            objects.sendContainerOp(obj, a.c < 0 and 'take' or 'put', recId, mine)
+            if a.c < 0 then a.c, a.p = a.c + mine, a.p - mine else a.c, a.p = a.c - mine, a.p + mine end
+        end
+        if a.c == 0 and a.p == 0 then acc[recId] = nil
+        elseif now - a.since > MATCH_WINDOW_S then
+            if a.c ~= 0 then
+                print(string.format('[mp] loot: %s %d x %s changed with no matching change in our pack -- not ours, not reported',
+                    tostring(obj.recordId), a.c, tostring(recId)))
+            end
+            acc[recId] = nil -- a lone pack change (a potion drunk, a pickup) is not this container's business
         end
     end
     watch.last = current
+    watch.pack = pack
 end
 
 local function trackContainerData(key, items, seq)
@@ -335,6 +513,42 @@ end
 
 -- ---------------------------------------------------------------- local signals
 
+-- PICKING UP A WORLD ITEM IS A REQUEST, NOT AN ANNOUNCEMENT.
+--
+-- This used to let the engine move the item into the inventory natively and relay an
+-- ObjectDelete afterwards -- which the server accepts idempotently. Two players activating the
+-- same item therefore BOTH kept it: the second delete was a silent no-op on a tombstone, but
+-- both clients had already taken it locally. A duplication race in the most ordinary
+-- interaction in the game. Containers never worked like that (ContainerOpRequest asks and the
+-- losing racer is told 'gone'); this is the same shape for loose items.
+--
+-- Registered through I.Activation (objects.init): a handler that returns false cancels the
+-- native activation (files/data/scripts/omw/activationhandlers.lua), exactly as quests.lua does
+-- for NPC dialogue locks. On the server's ok the REAL ActionTake runs via
+-- world._runStandardActivationAction, so theft detection (itemTaken) and everything else on that
+-- path still happens; on 'gone' nothing does, and the relayed ObjectDelete removes the item.
+local function onItemActivate(object, actor)
+    if not deps.ownIdFn() then return nil end -- not Joined: native, as in singleplayer
+    local player = deps.playerFn()
+    if not player or actor.id ~= player.id then return nil end
+    if not types.Item.isCarriable(object) then return nil end
+    local ck = cellKeyOfObj(object)
+    if isChargenCell(ck) then return nil end -- tutorial cells are local-only, by design
+    local addr = addrOf(object)
+    if not addr then
+        -- Nothing on the wire can name this object, so there is nothing to ask about. Native,
+        -- and unreported -- the same outcome the old announce path had for it.
+        return nil
+    end
+    opCounter = opCounter + 1
+    pendingTakes[opCounter] = { obj = object, at = core.getRealTime() }
+    local body = { opId = opCounter, cellKey = ck }
+    for k, v in pairs(addr) do body[k] = v end
+    mp.sendEvent('ObjectTakeRequest', body)
+    return false -- hold the native take until the server answers
+end
+
+
 -- GLOBAL onActivate: pickups, doors, locks, containers all start here.
 function objects.onActivate(object, actor)
     local player = deps.playerFn()
@@ -342,22 +556,25 @@ function objects.onActivate(object, actor)
     local now = core.getRealTime()
 
     if types.Item.objectIsInstance(object) and types.Item.isCarriable(object) then
-        -- Pickup: activation moves the item into the inventory natively; relay the delete.
-        if sendAddressed('ObjectDelete', object) then
-            recentPickups[object.id] = now
-            local netId = objIdToNet[object.id]
-            if netId then
-                netToObj[netId] = nil
-                objIdToNet[object.id] = nil
-            end
-        end
+        -- Pickups are a REQUEST now (onItemActivate below, an I.Activation handler that
+        -- suppresses the native take). Nothing to announce here: the server relays the
+        -- ObjectDelete itself when it grants the take.
         return
     end
 
     if types.Door.objectIsInstance(object) and not types.Door.isTeleport(object) then
-        -- Rotating door: state flips over the next frames; read the RESULT shortly after.
+        -- Rotating door: the builtin activation handler ran before us, so the swing has
+        -- already STARTED -- send the intended state now (#199: waiting ~1-1.5 s for Idle
+        -- let the owner walk through while the peer's avatar was stopped by the closed
+        -- door and rubber-banded). The settle read below confirms the result once Idle.
         -- (Teleport doors need no sync — each client walks through locally.)
-        doorPending[object.id] = { obj = object, at = now + DOOR_READ_DELAY }
+        local pending = { obj = object, at = now + DOOR_READ_DELAY, activatedAt = now }
+        local okS, st = pcall(types.Door.getDoorState, object)
+        if okS and (st == types.Door.STATE.Opening or st == types.Door.STATE.Closing) then
+            pending.sent = st == types.Door.STATE.Opening
+            sendAddressed('DoorState', object, { open = pending.sent })
+        end
+        doorPending[object.id] = pending
     end
 
     if types.Lockable.objectIsInstance(object) then
@@ -374,13 +591,15 @@ function objects.onActivate(object, actor)
     -- duplicate across everyone who opens them.
     if isLootable(object) then
         -- Deferred: the contents may not exist yet at this instant (see CONTAINER_OPEN_DELAY).
-        containerOpenPending[object.id] = { obj = object, at = now + CONTAINER_OPEN_DELAY }
+        -- The pack as it was WHEN the player opened it: a put made before the watch arms
+        -- (CONTAINER_OPEN_DELAY later) has already left the pack by then (s31).
+        containerOpenPending[object.id] = { obj = object, at = now + CONTAINER_OPEN_DELAY, pack = packSnapshot() }
     end
 end
 
 -- The deferred half of a container open: snapshot the contents once the engine has actually
 -- populated them, tell the server, and start watching for takes from that same snapshot.
-local function openContainerNow(object, now, live)
+local function openContainerNow(object, now, live, packAtOpen)
     if not (object and object:isValid()) then return end
     local snapshot = snapshotContainer(object, live)
     -- A merchant's purse rides the open alongside its stock: same object, same refKey, and it
@@ -411,7 +630,7 @@ local function openContainerNow(object, now, live)
         local tries = (openRetries[object.id] or 0) + 1
         if object:isValid() and tries <= CONTAINER_OPEN_RETRIES then
             openRetries[object.id] = tries
-            containerOpenPending[object.id] = { obj = object, at = now + CONTAINER_OPEN_DELAY, live = live }
+            containerOpenPending[object.id] = { obj = object, at = now + CONTAINER_OPEN_DELAY, live = live, pack = packAtOpen }
         else
             openRetries[object.id] = nil
             -- Give up LOUDLY. The whole failure mode here is silence.
@@ -424,12 +643,18 @@ local function openContainerNow(object, now, live)
         containerWatch[object.id] = {
             obj = object,
             last = snapshot,
+            pack = packAtOpen or packSnapshot(), -- what a take must show up in (diffContainer), from the open
             live = live, -- a merchant stays alive while we watch it; a corpse does not
             gold = gold, -- baseline to diff the purse against when the window closes
             -- Poll on the NEXT tick, not a quarter second from now. A harvest can resolve and the
             -- object can go away inside that gap, and the take is then unreportable.
             nextPoll = 0,
-            until_ = now + CONTAINER_WATCH_SECONDS,
+            -- A chest has no close signal, so its watch expires. A service window HAS one
+            -- (onBarterClose ends every live watch), so a live watch never expires: sharing the
+            -- chest's 15 s meant a longer trade stopped syncing -- stock dupes, the gold delta
+            -- never sent, training paid into a per-client purse. The tick's invalid-object
+            -- branch still ends a live watch whose merchant went away.
+            until_ = live and math.huge or (now + CONTAINER_WATCH_SECONDS),
         }
         return
     end
@@ -466,7 +691,18 @@ end
 function objects.onBarterOpen(merchant)
     if not (merchant and merchant:isValid()) then return end
     local now = core.getRealTime()
-    containerOpenPending[merchant.id] = { obj = merchant, at = now + CONTAINER_OPEN_DELAY, live = true }
+    containerOpenPending[merchant.id] = { obj = merchant, at = now + CONTAINER_OPEN_DELAY, live = true, pack = packSnapshot() }
+end
+
+-- THE HOLDER'S CORPSE IS THE LOOT (#297). Corpse contents used to become canonical from
+-- whichever client opened it first, i.e. that client's local copy: the potions the peer's
+-- NPC drank and the arrows it fired were still in it, the levelled roll was that engine's,
+-- and the weapon it fought with was not the one looted. The holder reports the corpse the
+-- moment it dies, through the same first-opener path, so every later open is served the
+-- holder's copy. No delay: an NPC's inventory is populated at cell load, not on activation.
+function objects.onCorpse(obj)
+    if not (obj and obj:isValid()) or not isLootable(obj) then return end
+    containerOpenPending[obj.id] = { obj = obj, at = core.getRealTime() }
 end
 
 -- Closing the window is the moment to reconcile: the engine has finished moving items both
@@ -503,11 +739,44 @@ function objects.onItemActive(item)
     for _, obj in pairs(pendingSpawns) do
         if obj.id == item.id then return end
     end
+    -- ON THE PEER a runtime item is the WORLD's: an arrow the avatar shot and missed, ammo
+    -- a creature dropped when it died, an item a script placed. Its own player is a dummy
+    -- parked far from everyone, so the range test below never passed and every such item
+    -- stayed on the peer's engine alone -- you could not pick your arrows back up. Named as
+    -- a placement (no owner, no conservation debit) when it appears near any avatar.
+    if mp.isSystem and mp.isSystem() then
+        if not (deps.allAvatarsFn and item.cell) then return end
+        for _, av in ipairs(deps.allAvatarsFn()) do
+            local okd, d = pcall(function() return (item.position - av.position):length() end)
+            if okd and d <= DROP_DETECT_RANGE then
+                objects.requestSpawn(item, nil, nil, false)
+                return
+            end
+        end
+        return
+    end
     local player = deps.playerFn()
     if not player then return end
     local ok, dist = pcall(function() return (item.position - player.position):length() end)
     if not ok or dist > DROP_DETECT_RANGE then return end
+    -- Backlog 109: under input authority our engine still launches the projectile locally
+    -- while the peer's avatar launches the real one. A missed arrow then lands on BOTH
+    -- engines and each reported it as a placement (ours with fromInventory=true, the peer's
+    -- with false): a friend saw two arrows. The peer's copy is the one that counts; drop ours.
+    if peerRules and isAmmo(item) then
+        pcall(function() item:remove() end)
+        return
+    end
+    -- SAID: this is the line that turned a corpse's crab meat into a 'drop' on prod (2026-10-15,
+    -- the take credited, then a world.spawn by the player debited it). clientlog ships it.
+    print(string.format('[mp] drop: %d x %s appeared %.0f u from us, reported as dropped from our pack', item.count or 1, tostring(item.recordId), dist))
     objects.requestSpawn(item, nil, nil, true) -- came OUT of our inventory: conservation applies
+end
+
+-- global.lua localSummonsTick: true while a holder (or the server's simulated flag) rules
+-- our body, i.e. while the peer's avatar fires the real projectiles.
+function objects.setPeerRules(v)
+    peerRules = v == true
 end
 
 -- Register a locally-created runtime object with the server (drops, test chests). The
@@ -517,7 +786,34 @@ end
 -- to being PLACED by a script or tool. The server can only apply "you cannot drop what you
 -- do not have" to the former — ObjectSpawnRequest is the generic place-an-object op, and
 -- refusing everything unowned wrongly blocked scripted containers nobody carries.
-function objects.requestSpawn(obj, posOverride, cellKeyOverride, fromInventory)
+-- THE ITEM'S OWN STATE, for a drop: wear, charge, the soul in a gem. A placement carried the
+-- record and the count only, so a friend picked up a pristine, fully charged copy of what
+-- was dropped -- a half-charged ring dropped and picked up was a free recharge. Same shape
+-- as identity.lua itemState; applied on every other client in MP_ObjectPlace.
+local function itemStateOf(obj)
+    local ok, d = pcall(function() return types.Item.itemData(obj) end)
+    if not ok or d == nil then return nil end
+    local st, any = {}, false
+    local okc, c = pcall(function() return d.condition end)
+    if okc and type(c) == 'number' then st.condition = c; any = true end
+    local oke, e = pcall(function() return d.enchantmentCharge end)
+    if oke and type(e) == 'number' then st.charge = e; any = true end
+    local oks, sl = pcall(function() return d.soul end)
+    if oks and type(sl) == 'string' and sl ~= '' then st.soul = sl; any = true end
+    return any and st or nil
+end
+local function applyItemState(obj, st)
+    if type(st) ~= 'table' then return end
+    pcall(function()
+        local d = types.Item.itemData(obj)
+        if not d then return end
+        if type(st.condition) == 'number' then d.condition = st.condition end
+        if type(st.charge) == 'number' then d.enchantmentCharge = st.charge end
+        if type(st.soul) == 'string' and st.soul ~= '' then d.soul = st.soul end
+    end)
+end
+
+function objects.requestSpawn(obj, posOverride, cellKeyOverride, fromInventory, actor)
     tempCounter = tempCounter + 1
     pendingSpawns[tempCounter] = obj
     local pos = posOverride or obj.position
@@ -525,6 +821,7 @@ function objects.requestSpawn(obj, posOverride, cellKeyOverride, fromInventory)
     if not okYaw or rotZ ~= rotZ then rotZ = 0 end -- NaN pre-placement
     mp.sendEvent('ObjectSpawnRequest', {
         tempId = tempCounter,
+        state = (not actor) and itemStateOf(obj) or nil,
         -- M7: a client-minted record id is meaningless (and dangerous) on a peer — send the
         -- server's recordNetId when this record has one. Content ids pass through.
         recordId = worldmp.toNet(obj.recordId),
@@ -535,6 +832,9 @@ function objects.requestSpawn(obj, posOverride, cellKeyOverride, fromInventory)
         rotZ = rotZ,
         count = math.max(obj.count or 1, 1), -- unplaced objects report count 0; server needs >=1
         fromInventory = fromInventory == true,
+        -- The holder naming a runtime-spawned NPC/creature (actors.lua): every client builds
+        -- it from the record and puppets it; the actor stream then addresses it by net id.
+        actor = actor == true or nil,
     })
 end
 
@@ -543,6 +843,7 @@ end
 local handlers = {}
 
 handlers.MP_ObjectSpawnAck = function(data)
+    if data.tempId == nil then return end -- no key, nothing to clear: t[nil] = nil throws, and a throwing handler goes silent
     local obj = pendingSpawns[data.tempId]
     pendingSpawns[data.tempId] = nil
     if not (obj and obj:isValid() and data.netId) then return end
@@ -553,6 +854,40 @@ handlers.MP_ObjectSpawnAck = function(data)
     netSpawned[obj.id] = true
 end
 
+-- The server refused a drop. The local object was already placed optimistically, so put it
+-- back where the server says it still is -- in the inventory -- and tell the player. Without
+-- this the item sat in the world unnetted forever, invisible to everyone else.
+handlers.MP_ObjectSpawnRefused = function(data)
+    local obj = data and pendingSpawns[data.tempId]
+    if data and data.tempId ~= nil then pendingSpawns[data.tempId] = nil end
+    if obj and obj:isValid() and types.Actor.objectIsInstance(obj) then
+        -- The holder's naming of a runtime actor was refused (a full cell): it stays a local
+        -- creature nobody else sees, which is the pre-2026-09-11 state, not an item to pocket.
+        print('[mp] net actor naming refused: ' .. tostring(data and data.reason))
+        return
+    end
+    local player = deps.playerFn()
+    if obj and obj:isValid() and player then
+        local okM, errM = pcall(function() obj:moveInto(types.Actor.inventory(player)) end)
+        if not okM then
+            print(string.format('[mp] refused drop of %s could not go back into the pack: %s',
+                tostring(obj.recordId), tostring(errM)))
+        end
+    end
+    if deps.noticeFn then
+        local why = {
+            unowned = 'That drop was refused: the world does not think you are carrying it.',
+            contained = 'Your account cannot place items in a shared world right now.',
+            cell_full = 'This place is too cluttered to drop anything more here.',
+            -- #399: a human ObjectSpawnRequest{actor} (a PlaceAtPC the engine declined) has tempId 0
+            -- and no drop behind it; reach/rate are its refusals, not a drop's.
+            reach = 'That summons was refused: too far away, or too many at once.',
+            rate = 'That summons was refused: too many creatures this minute.',
+        }
+        deps.noticeFn(why[tostring(data and data.reason or '')] or 'That drop was refused.')
+    end
+end
+
 handlers.MP_ObjectPlace = function(data)
     if not data.netId or netToObj[data.netId] then return end -- own echo: already mapped
     -- M7 RecordsSync: a player-made item arrives as a server recordNetId; resolve it to the
@@ -560,6 +895,29 @@ handlers.MP_ObjectPlace = function(data)
     -- dynamic id, which could collide with an unrelated local record here.
     local recordId = worldmp.toLocal(data.recordId)
     local ok, obj = pcall(function() return world.createObject(recordId, data.count or 1) end)
+    if data.actor then
+        -- A runtime-spawned NPC/creature the holder named. Built from the record here and
+        -- puppeted by the non-holder sweep like any other actor in the cell; no stand-in --
+        -- a wrong body computes nothing, it just is not there.
+        if not (ok and types.Actor.objectIsInstance(obj)) then
+            if ok then pcall(function() obj:remove() end) end
+            print('[mp] net actor unresolvable: ' .. tostring(data.recordId))
+            return
+        end
+        local cellArg = data.cellKey and (data.cellKey:match('^%-?%d+,%-?%d+$') and '' or data.cellKey)
+        if not cellArg then
+            local player = deps.playerFn()
+            cellArg = (player and player.cell and not player.cell.isExterior) and player.cell.name or ''
+        end
+        pcall(function() obj:teleport(cellArg, util.vector3(data.x, data.y, data.z),
+            { rotation = util.transform.rotateZ(data.rotZ or 0) }) end)
+        netToObj[data.netId] = obj
+        objIdToNet[obj.id] = data.netId
+        netSpawned[obj.id] = true
+        netActorCount = netActorCount + 1
+        pcall(function() mp.set('netActors', tostring(netActorCount)) end) -- scenario mirror
+        return
+    end
     -- Foreign dynamic record ids can COLLIDE with unrelated local dynamic records (each
     -- client numbers its own "$dynamic" records — B's may be a puppet NPC record!): only
     -- accept a resolution that is actually an item; anything else gets the stand-in.
@@ -573,10 +931,10 @@ handlers.MP_ObjectPlace = function(data)
         if not placeholder then return end
         obj = world.createObject(placeholder, data.count or 1)
     end
-    local player = deps.playerFn()
-    local cellArg = (player and player.cell and not player.cell.isExterior) and player.cell.name or ''
+    local cellArg = cellArgFor(data.cellKey)
     obj:teleport(cellArg, util.vector3(data.x, data.y, data.z),
         { rotation = util.transform.rotateZ(data.rotZ or 0) })
+    if ok then applyItemState(obj, data.state) end -- the dropper's wear/charge/soul, not a fresh copy's
     netToObj[data.netId] = obj
     objIdToNet[obj.id] = data.netId
     netSpawned[obj.id] = true
@@ -585,33 +943,81 @@ end
 handlers.MP_ObjectDelete = function(data)
     local obj = resolveBody(data)
     if not obj then return end
-    if isOwnEcho(data) or recentPickups[obj.id] then return end
+    -- OUR OWN TAKE'S ECHO is the delete for the NET ID we took, not for the object. The
+    -- object outlives the take (it moves into our inventory), and if we drop it again it is
+    -- placed under a NEW net id -- a delete naming that one is a friend picking it up, which
+    -- keyed on the object id read as our stale echo and left the item lying on our screen
+    -- after they had it in their pocket. Trading back within the guard window did exactly this.
+    if isOwnEcho(data) or (data.net ~= nil and recentTakes[data.net]) then return end
     local netId = objIdToNet[obj.id]
     if netId then
         netToObj[netId] = nil
         objIdToNet[obj.id] = nil
     end
-    pcall(function() obj:remove() end)
+    retry.remove(obj) -- refused mid-teleport: disabled now (no pickup), removed next frames
+end
+
+-- (Lives here, below `local handlers = {}`, on purpose: a `handlers.X = ...` placed ABOVE that
+-- declaration indexes a nil GLOBAL at module load and takes the whole script down.)
+handlers.MP_ObjectTakeResult = function(data)
+    local op = data and pendingTakes[data.opId]
+    if not op then return end
+    pendingTakes[data.opId] = nil
+    if not data.ok then
+        -- SAY SO. A refused pickup is an item that did not move when the player clicked it, and
+        -- silence there reads as a broken game. The reasons are read out of worldstate.ts by
+        -- the Lua test suite, so a new one server-side fails a test here instead of shipping.
+        if deps.noticeFn then
+            local why = {
+                gone = 'Someone got there first.',
+                unreachable = 'You cannot reach that.',
+                cell_full = 'This place has seen too much taken; it cannot be picked up here.',
+            }
+            deps.noticeFn(why[tostring(data.reason or '')] or 'You cannot take that right now.')
+        end
+        return -- the relayed ObjectDelete tidies the view if somebody else took it
+    end
+    local player = deps.playerFn()
+    local obj = op.obj
+    if not player or not obj or not obj:isValid() then return end
+    recentPickups[obj.id] = core.getRealTime() -- the cell frame's deleted list must not remove it twice
+    local netId = objIdToNet[obj.id]
+    if netId then
+        recentTakes[netId] = core.getRealTime() -- our own ObjectDelete echo, by the id it names
+        netToObj[netId] = nil
+        objIdToNet[obj.id] = nil
+    end
+    -- ONCE IT IS IN OUR POCKET IT IS OURS TO DROP. An item that ARRIVED from the net was
+    -- marked so its own ObjectPlace could never read as a local drop -- and the mark followed
+    -- the object into the inventory, so dropping it again was ignored as that same echo. An
+    -- item a friend handed you could not be handed on; trading stopped after one hop.
+    netSpawned[obj.id] = nil
+    -- The genuine ActionTake: itemTaken (crime), inventory add, world delete.
+    pcall(function() world._runStandardActivationAction(obj, player) end)
 end
 
 handlers.MP_ObjectMove = function(data)
     if isOwnEcho(data) then return end
     local obj = resolveBody(data)
     if not obj then return end
-    local player = deps.playerFn()
-    local cellArg = (player and player.cell and not player.cell.isExterior) and player.cell.name or ''
-    pcall(function()
-        obj:teleport(cellArg, util.vector3(data.x, data.y, data.z),
-            { rotation = util.transform.rotateZ(data.rotZ or 0) })
-    end)
+    retry.teleport(obj, cellArgFor(data.cellKey), util.vector3(data.x, data.y, data.z), nil,
+        { rotation = util.transform.rotateZ(data.rotZ or 0) })
+end
+
+-- A lock this client has just REPORTED itself (the harness door commands): the cell poll must
+-- not see the change as a script's and report it a second time. That duplicate arrived after a
+-- friend's unlock on a slow client and locked the door again under them (s32, #144/#147).
+function objects.noteLockSent(obj, level)
+    if obj then scriptLockWatch[obj.id] = level or false end
 end
 
 handlers.MP_ObjectLock = function(data)
     if isOwnEcho(data) then return end
     local obj = resolveBody(data)
     if not (obj and types.Lockable.objectIsInstance(obj)) then return end
-    -- Mute the lock watcher: a network apply must not bounce back as a local change.
+    -- Mute the lock watchers: a network apply must not bounce back as a local change.
     lockWatch[obj.id] = nil
+    scriptLockWatch[obj.id] = data.lockLevel or false
     if data.lockLevel then
         pcall(function() types.Lockable.lock(obj, data.lockLevel) end)
     else
@@ -623,22 +1029,48 @@ end
 -- appearing, a hidden door becoming real). Vanilla runs these locally on every client, but
 -- only the client whose script ran sees them once quest globals stop being world-relayed —
 -- so the change travels explicitly. enableWatch mutes the echo, exactly like locks.
+-- An ACTOR switched on or off by the network, said once per apply (s59 #150: an NPC that took
+-- one spell and then no more; enable/disable only started landing with 2094ccaf).
+local function sayActorEnabled(obj, want, via)
+    local ok, actor = pcall(function() return types.Actor.objectIsInstance(obj) end)
+    if ok and actor then print(string.format('[mp] actor %s %s via %s', tostring(obj.recordId), want and 'ENABLED' or 'DISABLED', via)) end
+end
+
 handlers.MP_ObjectEnabled = function(data)
     if isOwnEcho(data) then return end
     local obj = resolveBody(data)
     if not (obj and obj:isValid()) then return end
     local want = data.enabled ~= false
     enableWatch[obj.id] = want -- record BEFORE applying: the poll must not re-report this
-    pcall(function() obj:setEnabled(want) end)
+    sayActorEnabled(obj, want, 'ObjectEnabled')
+    -- A PROPERTY, NOT A METHOD. A global script turns a ref on and off by assigning
+    -- `obj.enabled` (mwlua/objectbindings.cpp); there is no obj:setEnabled, so this and the
+    -- snapshot paths below threw inside their pcalls and no enable or disable ever landed
+    -- on another client.
+    pcall(function() obj.enabled = want end)
 end
 
 handlers.MP_DoorState = function(data)
     if isOwnEcho(data) then return end
     local obj = resolveBody(data)
     if not (obj and types.Door.objectIsInstance(obj)) then return end
-    doorPending[obj.id] = nil -- network wins over a pending local read
+    -- Network wins over a pending local read -- except the stale-open race: a DoorState
+    -- for a door WE just activated that contradicts what we already sent is the other
+    -- side's echo of the state before our touch (#199); keep ours.
+    local pending = doorPending[obj.id]
+    if pending and pending.sent ~= nil and pending.sent ~= data.open
+        and core.getRealTime() - (pending.activatedAt or 0) < 1.5 then
+        return
+    end
+    doorPending[obj.id] = nil
+    if type(data.open) == 'boolean' then doorStateWatch[obj.id] = data.open end -- the poll must not re-report this
     if type(data.open) == 'boolean' and types.Door.isOpen(obj) ~= data.open then
         pcall(function() types.Door.activateDoor(obj, data.open) end)
+        -- activateDoor swings it silently (the sound lives in Door::activate): backlog 135.
+        pcall(function()
+            local snd = types.Door.record(obj)[data.open and 'openSound' or 'closeSound']
+            if snd and snd ~= '' then core.sound.playSound3d(snd, obj) end
+        end)
     end
 end
 
@@ -648,6 +1080,12 @@ local function applyMerchantGold(obj, gold)
     if not (obj and obj:isValid()) or type(gold) ~= 'number' then return end
     if not types.Actor.objectIsInstance(obj) then return end
     pcall(function() types.Actor.setBarterGold(obj, math.max(0, math.floor(gold))) end)
+    -- The purse delta we report on close is (now - baseline). The baseline was read from the
+    -- LOCAL purse before the canonical figure arrived, so closing a shop without trading
+    -- after somebody else had sent the server's delta of (canonical - local): every second
+    -- trader left the merchant broke.
+    local watch = containerWatch[obj.id]
+    if watch and watch.gold ~= nil then watch.gold = math.max(0, math.floor(gold)) end
 end
 
 handlers.MP_ContainerState = function(data)
@@ -663,7 +1101,9 @@ handlers.MP_ContainerUpdate = function(data)
     local key = data.net and netKey(data.net) or (obj and refKeyOfObj(obj))
     applyMerchantGold(obj, data.gold)
     local delta = data.delta or {}
-    if key then
+    -- A purse-only update (a merchant's gold refill, #165) carries no item: nothing to track
+    -- (objects.lua:942 'table index is nil' failed s160-s162 in #106).
+    if key and type(delta.itemId) == 'string' then
         local tracked = containerData[key] or { items = {}, seq = 0 }
         tracked.items[delta.itemId] = math.max(0, (tracked.items[delta.itemId] or 0) + (delta.dn or 0))
         tracked.seq = data.stateSeq or tracked.seq
@@ -671,8 +1111,11 @@ handlers.MP_ContainerUpdate = function(data)
     end
     -- Our own committed op comes back as an Update too (single apply path server-side);
     -- the native transfer already happened locally — consume instead of double-applying.
+    -- ONLY AN ANSWERED OP: our Result always precedes our own Update (worldstate.ts containerOp),
+    -- so an unanswered one is somebody else's win. Consumed, it ate the op that our "gone"
+    -- needed to undo the local take, and the loser of the race kept a duplicate.
     for opId, op in pairs(pendingOps) do
-        if op.key == key and op.itemId == delta.itemId
+        if op.resolved and op.key == key and op.itemId == delta.itemId
             and ((op.op == 'take' and (delta.dn or 0) < 0) or (op.op == 'put' and (delta.dn or 0) > 0)) then
             pendingOps[opId] = nil
             return
@@ -718,8 +1161,9 @@ handlers.MP_ContainerOpResult = function(data)
         if player then
             pcall(function()
                 local left = op.n
+                local localId = worldmp.toLocal(op.itemId)
                 for _, item in ipairs(types.Actor.inventory(player):getAll()) do
-                    if item.recordId == op.itemId and left > 0 then
+                    if item.recordId == localId and left > 0 then
                         local take = math.min(left, item.count)
                         item:remove(take)
                         left = left - take
@@ -748,7 +1192,7 @@ handlers.MP_CellSnapshotReplace = function(data)
         for _, obj in ipairs(cell:getAll()) do
             if obj:isValid() and not obj.enabled and not disabled[refKeyOfObj(obj)] then
                 enableWatch[obj.id] = true
-                pcall(function() obj:setEnabled(true) end)
+                pcall(function() obj.enabled = true end)
             end
         end
     end
@@ -758,35 +1202,54 @@ handlers.MP_CellSnapshotReplace = function(data)
 end
 
 handlers.MP_WorldCellState = function(data)
+    local named = {}
     for _, place in ipairs(data.placed or {}) do
         handlers.MP_ObjectPlace(place)
+        if place.actor and place.netId then named[place.netId] = true end
     end
+    -- COPIES THE WORLD NO LONGER HAS. A peer restart or a cell release purges the named actors
+    -- (worldstate.ts purgeNamedActors) with deletes only to whoever heard that cell then; anyone
+    -- else kept a nix-hound or cliff racer nothing streams (npcNoPose, prod 2026-10-23). The full
+    -- list (actorsComplete: the server did not trim it) says which of ours are still real.
+    -- Never on the peer: its named actors are the originals, not copies.
+    if data.actorsComplete == true and data.cellKey and not (mp.isSystem and mp.isSystem()) then
+        for netId, obj in pairs(netToObj) do
+            if not named[netId] and obj:isValid() and netSpawned[obj.id]
+                and types.Actor.objectIsInstance(obj) and cellKeyOfObj(obj) == data.cellKey then
+                netToObj[netId] = nil
+                objIdToNet[obj.id] = nil
+                netSpawned[obj.id] = nil
+                netActorCount = math.max(0, netActorCount - 1)
+                retry.remove(obj)
+            end
+        end
+    end
+    -- The dead stay dead for a late arrival (see actors.noteCellDeaths). Called with an empty
+    -- list too: the holder waits for the record itself before streaming bars (#431).
+    if deps.cellDeathsFn then deps.cellDeathsFn(data.cellKey, data.deaths or {}) end
     for _, refKey in ipairs(data.deleted or {}) do
         local obj = resolveRefKey(refKey)
-        if obj and obj:isValid() and not recentPickups[obj.id] then
+        if obj and obj:isValid() and not recentPickups[obj.id] and inWorld(obj) then
             local netId = objIdToNet[obj.id]
             if netId then
                 netToObj[netId] = nil
                 objIdToNet[obj.id] = nil
             end
-            pcall(function() obj:remove() end)
+            retry.remove(obj)
         end
     end
     for refKey, m in pairs(data.moved or {}) do
         local obj = resolveRefKey(refKey)
-        if obj and obj:isValid() then
-            local player = deps.playerFn()
-            local cellArg = (player and player.cell and not player.cell.isExterior) and player.cell.name or ''
-            pcall(function()
-                obj:teleport(cellArg, util.vector3(m.x, m.y, m.z),
-                    { rotation = util.transform.rotateZ(m.rotZ or 0) })
-            end)
+        if obj and obj:isValid() and inWorld(obj) then
+            retry.teleport(obj, cellArgFor(data.cellKey), util.vector3(m.x, m.y, m.z), nil,
+                { rotation = util.transform.rotateZ(m.rotZ or 0) })
         end
     end
     for refKey, lockInfo in pairs(data.locks or {}) do
         local obj = resolveRefKey(refKey)
         if obj and obj:isValid() and types.Lockable.objectIsInstance(obj) then
             lockWatch[obj.id] = nil
+            scriptLockWatch[obj.id] = lockInfo.lockLevel or false
             if lockInfo.lockLevel then
                 pcall(function() types.Lockable.lock(obj, lockInfo.lockLevel) end)
             else
@@ -806,14 +1269,32 @@ handlers.MP_WorldCellState = function(data)
         local obj = resolveRefKey(refKey)
         if obj then setContainerContents(obj, cont.items or {}) end
     end
-    -- Phase 4: refs a script disabled. Only disables are recorded server-side (enabled is
-    -- the vanilla default), so this list is authoritative for "hidden", and everything
-    -- absent from it keeps whatever the content files say.
+    -- Phase 4: refs a script disabled, and (backlog 218) refs a script re-enabled after a
+    -- persisted disable -- a reveal the content files do not know about. Everything absent
+    -- from both keeps whatever the content files say.
     for _, refKey in ipairs(data.disabled or {}) do
         local obj = resolveRefKey(refKey)
         if obj and obj:isValid() then
             enableWatch[obj.id] = false
-            pcall(function() obj:setEnabled(false) end)
+            sayActorEnabled(obj, false, 'cell state')
+            pcall(function() obj.enabled = false end)
+        end
+    end
+    for _, refKey in ipairs(data.enabled or {}) do
+        local obj = resolveRefKey(refKey)
+        if obj and obj:isValid() then
+            enableWatch[obj.id] = true
+            pcall(function() obj.enabled = true end)
+        end
+    end
+    -- M6 per-object script locals: the same apply path as a live MemberVarUpdate (quests.lua),
+    -- one call per variable, so a late arrival's scripted objects resume where the cell left off.
+    if deps.memberVarFn then
+        for refKey, vars in pairs(data.memberVars or {}) do
+            local obj = resolveRefKey(refKey)
+            if obj then
+                for name, value in pairs(vars) do deps.memberVarFn({ ref = obj, name = name, value = value }) end
+            end
         end
     end
 end
@@ -830,12 +1311,47 @@ end
 
 objects.handlers = handlers
 
+-- ---------------------------------------------------------------- script notes
+
+-- WHAT A SCRIPT DID THAT THE OWN-CELL POLL CANNOT SEE (mp.takeScriptNotes, backlog 213/214/218).
+-- The engine records every Enable/Disable at its one choke point (World::enable), so a Startup
+-- or dialogue script toggling a ref in a cell the player has never visited is reported under
+-- THE OBJECT's cell -- the object itself may not even resolve here (no cell loaded), and the
+-- relay needs only its id and that key. And a PlaceAtPC actor the client declined to build
+-- (localSpawns off) is asked of the server, which has the holder spawn it (mpQuestSpawn).
+function objects.onScriptNote(n)
+    if n.kind == 'enable' then
+        local obj = n.ref
+        if not obj or type(n.cellKey) ~= 'string' or n.cellKey == '' then return end
+        local on = n.on == true
+        -- enableWatch is the echo mute: a network apply (MP_ObjectEnabled) writes the value
+        -- before touching the object, so its own World::enable note reads as already known.
+        if enableWatch[obj.id] == on then return end
+        enableWatch[obj.id] = on
+        sendAddressed('ObjectEnabled', obj, { enabled = on, cellKey = n.cellKey })
+    elseif n.kind == 'spawn' then
+        if type(n.recordId) ~= 'string' or type(n.cellKey) ~= 'string' or isChargenCell(n.cellKey) then return end
+        mp.sendEvent('ObjectSpawnRequest', {
+            tempId = 0, actor = true, recordId = n.recordId, cellKey = n.cellKey,
+            x = n.x, y = n.y, z = n.z, rotZ = 0, count = math.max(1, math.floor(tonumber(n.count) or 1)),
+        })
+    end
+end
+
 -- ---------------------------------------------------------------- tick
 
 function objects.tick(now)
+    frameNo = frameNo + 1
+    -- Finish container rewrites whose adds have landed since (setContainerContents).
+    for id, redo in pairs(containerRedo) do
+        if redo.gen < reconcile.generation() then
+            containerRedo[id] = nil
+            if redo.obj:isValid() then setContainerContents(redo.obj, redo.items) end
+        end
+    end
     -- Phase 4: watch the player's cell for scripted enable/disable. Cheap (a boolean read
-    -- per object at 1 Hz) and only for the cell we are standing in, which is the only one
-    -- whose scripts are running for us anyway.
+    -- per object at 1 Hz) and only for the cell we are standing in. The fallback behind
+    -- onScriptNote above, for an engine baked before the choke-point hook existed.
     if now >= nextEnablePoll then
         nextEnablePoll = now + ENABLE_POLL
         local player = deps.playerFn()
@@ -853,13 +1369,68 @@ function objects.tick(now)
                     end
                 end
             end
+            -- Locks, over the 3x3 (doors and containers only, so it stays cheap): the door a
+            -- script locks is often in the NEXT cell over from where the player stands --
+            -- an exterior loads its neighbours, and a village straddles a cell line.
+            -- On the peer, every held cell too (the dummy's 3x3 is not where the NPCs are).
+            local function keyOf(c) return c.isExterior and (c.gridX .. ',' .. c.gridY) or c.name end
+            local cells, seen = { cell }, { [keyOf(cell)] = true }
+            local function addCell(c)
+                local k = keyOf(c)
+                if not seen[k] then seen[k] = true; cells[#cells + 1] = c end
+            end
+            if cell.isExterior then
+                for dx = -1, 1 do
+                    for dy = -1, 1 do
+                        if dx ~= 0 or dy ~= 0 then
+                            local okC, c = pcall(world.getExteriorCell, cell.gridX + dx, cell.gridY + dy)
+                            if okC and c then addCell(c) end
+                        end
+                    end
+                end
+            end
+            local peer = mp.isSystem and mp.isSystem()
+            if peer and deps.heldCellsFn then
+                for _, c in ipairs(deps.heldCellsFn()) do addCell(c) end
+            end
+            for _, c in ipairs(cells) do
+                for _, kind in ipairs({ types.Door, types.Container }) do
+                    local okL, list = pcall(function() return c:getAll(kind) end)
+                    for _, obj in ipairs(okL and list or {}) do
+                        if obj:isValid() then
+                            if peer and kind == types.Door and not types.Door.isTeleport(obj) then
+                                -- Door swing (#289): report once settled (Idle), like doorPending.
+                                local okS, st = pcall(types.Door.getDoorState, obj)
+                                if okS and st == types.Door.STATE.Idle then
+                                    local open = not types.Door.isClosed(obj)
+                                    local had = doorStateWatch[obj.id]
+                                    if had == nil then
+                                        doorStateWatch[obj.id] = open
+                                    elseif had ~= open then
+                                        doorStateWatch[obj.id] = open
+                                        sendAddressed('DoorState', obj, { open = open })
+                                    end
+                                end
+                            end
+                            local level = types.Lockable.isLocked(obj) and types.Lockable.getLockLevel(obj) or false
+                            local had = scriptLockWatch[obj.id]
+                            if had == nil then
+                                scriptLockWatch[obj.id] = level
+                            elseif had ~= level and not lockWatch[obj.id] then -- an activation's own watch reports its own
+                                scriptLockWatch[obj.id] = level
+                                sendAddressed('ObjectLock', obj, { lockLevel = level or nil })
+                            end
+                        end
+                    end
+                end
+            end
         end
     end
 
     for id, pending in pairs(containerOpenPending) do
         if now >= pending.at then
             containerOpenPending[id] = nil
-            openContainerNow(pending.obj, now, pending.live)
+            openContainerNow(pending.obj, now, pending.live, pending.pack)
         end
     end
 
@@ -881,7 +1452,10 @@ function objects.tick(now)
             end
             if ready or now > pending.until_ then
                 equipPending[id] = nil
-                pcall(function() types.Actor.setEquipment(obj, pending.slots) end)
+                -- ON THE ACTOR. setEquipment is Self-gated (mwlua/types/actor.cpp), so called
+                -- from here it threw inside the pcall and every merchant stayed stripped;
+                -- companion.lua is on every NPC and creature and equips itself.
+                pcall(function() obj:sendEvent('mpSetEquipment', pending.slots) end)
             end
         end
     end
@@ -891,10 +1465,20 @@ function objects.tick(now)
             doorPending[id] = nil
             local obj = pending.obj
             if obj:isValid() then
-                -- Report the state the door is HEADING to (isOpen is false mid-swing, so
-                -- use "not fully closed" as the intent).
-                local open = not types.Door.isClosed(obj)
-                sendAddressed('DoorState', obj, { open = open })
+                -- ONCE THE SWING IS OVER. isClosed is only true in the Idle state, and a
+                -- closing door at 90 deg/s is still Closing 0.4 s after the touch -- so every
+                -- close was reported as "open", nobody else ever saw a door shut, and the
+                -- closer found it open again on their next visit. Wait for Idle (bounded).
+                local okS, st = pcall(types.Door.getDoorState, obj)
+                local idle = not okS or st == nil or st == types.Door.STATE.Idle
+                if not idle and (pending.tries or 0) < 8 then
+                    pending.tries = (pending.tries or 0) + 1
+                    pending.at = now + 0.3
+                    doorPending[id] = pending
+                else
+                    local open = not types.Door.isClosed(obj)
+                    if pending.sent ~= open then sendAddressed('DoorState', obj, { open = open }) end
+                end
             end
         end
     end
@@ -907,8 +1491,9 @@ function objects.tick(now)
             local locked = types.Lockable.isLocked(obj)
             if locked ~= watch.locked then
                 watch.locked = locked
-                sendAddressed('ObjectLock', obj,
-                    { lockLevel = locked and types.Lockable.getLockLevel(obj) or nil })
+                local level = locked and types.Lockable.getLockLevel(obj) or nil
+                scriptLockWatch[id] = level or false -- the cell poll must not report it again
+                sendAddressed('ObjectLock', obj, { lockLevel = level })
             end
         end
     end
@@ -937,36 +1522,44 @@ function objects.tick(now)
     for id, t in pairs(recentPickups) do
         if now - t > ECHO_GUARD_SECONDS then recentPickups[id] = nil end
     end
+    for id, t in pairs(recentTakes) do
+        if now - t > ECHO_GUARD_SECONDS then recentTakes[id] = nil end
+    end
 
     for opId, op in pairs(pendingOps) do
         if op.at and now - op.at > 10 then pendingOps[opId] = nil end
+    end
+    for opId, op in pairs(pendingTakes) do
+        if now - op.at > 10 then pendingTakes[opId] = nil end -- an unanswered take is a native no-op
     end
 
     if now - lastMirror >= 0.5 then
         lastMirror = now
         local netObjs = {}
         for netId, obj in pairs(netToObj) do
-            if obj:isValid() then netObjs[tostring(netId)] = obj.recordId end
+            if obj:isValid() then netObjs[string.format('%.0f', netId)] = obj.recordId end
         end
-        mp.testSet('netObjects', json.encode(netObjs))
+        mp.set('netObjects', json.encode(netObjs))
         -- Display names of the net objects: a PLACEHOLDER stand-in still "exists", so the
         -- scenarios have to compare the resolved record, not the count (§M7 records).
         local netNames = {}
         for netId, obj in pairs(netToObj) do
             if obj:isValid() then
-                netNames[tostring(netId)] = worldmp.recordNameOf(obj.recordId) or ''
+                netNames[string.format('%.0f', netId)] = worldmp.recordNameOf(obj.recordId) or ''
             end
         end
-        mp.testSet('netObjectNames', json.encode(netNames))
+        mp.set('netObjectNames', json.encode(netNames))
         local conts = {}
         for key, c in pairs(containerData) do
             conts[key] = c.items
         end
-        mp.testSet('containerItems', json.encode(conts))
+        mp.set('containerItems', json.encode(conts))
     end
 end
 
 function objects.sendContainerOp(obj, op, itemId, n)
+    -- SAID, so a lost loot can be followed on prod (clientlog ships '[mp] loot:' lines).
+    print(string.format('[mp] loot: %s %d x %s %s %s', tostring(op), n or 0, tostring(itemId), op == 'take' and 'from' or 'into', tostring(obj and obj.recordId)))
     if isChargenCell(cellKeyOfObj(obj)) then
         dropOut('ContainerOpRequest', 'chargen-cell', tostring(obj.recordId))
         return nil -- tutorial cells are local-only, by design
@@ -979,6 +1572,7 @@ function objects.sendContainerOp(obj, op, itemId, n)
         dropOut('ContainerOpRequest', 'unaddressable', tostring(obj.recordId))
         return nil
     end
+    itemId = worldmp.toNet(itemId) -- net form: the Update echo names it in net form and consumes this op
     pendingOps[opCounter] = { op = op, itemId = itemId, n = n, key = refKeyOfObj(obj), obj = obj, at = core.getRealTime() }
     local body = { opId = opCounter, op = op, itemId = itemId, n = n, cellKey = cellKeyOfObj(obj) }
     for k, v in pairs(addr) do body[k] = v end
@@ -1034,7 +1628,7 @@ function objects.forgetCell(cellKey)
             if obj and obj:isValid() then
                 objIdToNet[obj.id] = nil
                 netSpawned[obj.id] = nil
-                pcall(function() obj:remove() end)
+                retry.remove(obj)
             end
         end
     end
@@ -1050,6 +1644,7 @@ function objects.reset()
     pendingSpawns = {}
     pendingOps = {}
     recentPickups = {}
+    pendingTakes = {}
     doorPending = {}
     containerOpenPending = {}
     -- Retry counters go with the pending opens they belong to, or a world switch would
@@ -1057,12 +1652,31 @@ function objects.reset()
     openRetries = {}
     lockWatch = {}
     enableWatch = {}
+    doorStateWatch = {}
     nextEnablePoll = 0
     containerWatch = {}
     containerData = {}
 end
 
 function objects.init(d)
+    -- Arm the pickup veto for every carriable type (see onItemActivate). An EXPLICIT list,
+    -- per concrete type, because addHandlerForType keys on obj.type (a weapon's type is
+    -- Weapon, not Item). The first version iterated `pairs(types)` and matched on
+    -- `t.baseType == types.Item`; through the read-only proxy that armed ZERO types --
+    -- measured -- and the native take then ran with nobody asking, which is worse than the
+    -- announce path it replaced. These names are the engine's own (mwlua ObjectTypeName).
+    if I and I.Activation and I.Activation.addHandlerForType then
+        local n, missing = 0, {}
+        for _, name in ipairs({ 'Armor', 'Clothing', 'Ingredient', 'Light', 'Miscellaneous', 'Potion', 'Weapon', 'Book', 'Lockpick', 'Probe', 'Apparatus', 'Repair' }) do
+            local t = types[name]
+            if t then I.Activation.addHandlerForType(t, onItemActivate); n = n + 1
+            else missing[#missing + 1] = name end
+        end
+        print('[mp] pickup veto armed for ' .. n .. ' item types'
+            .. (#missing > 0 and (' (missing: ' .. table.concat(missing, ',') .. ')') or ''))
+    else
+        print('[mp] WARNING: I.Activation unavailable -- pickups are announced, not requested')
+    end
     deps = d
 end
 

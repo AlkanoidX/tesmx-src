@@ -11,11 +11,12 @@
 -- forwarding the raw attack here.
 -- Inbound: we re-emit the stock `Hit` local event on the real victim, so the builtin
 -- pipeline runs verbatim for our own player and for actors under our authority.
+local hitFwdCount = 0 -- test mirror: forwarded hits this session (combat.lua fwd)
 local core = require('openmw.core')
 local types = require('openmw.types')
 local util = require('openmw.util')
 local mp = require('openmw.mp')
-local threat = require('scripts.mp.threat')
+local worldmp = require('scripts.mp.world')
 
 local combat = {}
 
@@ -31,6 +32,29 @@ local lastHitTaken = nil -- diagnostic mirror for the scenarios
 -- puppet object itself (a GameObject serializes as its RefNum through the event, so we get a
 -- resolvable object back here).
 function combat.onPuppetHit(data)
+    -- Phase 4C: WHEN THE PEER SIMULATES, THE AVATAR'S OWN SWING COMPUTES MELEE. The owner's
+    -- use bit rides the input tier; the peer's engine swings the avatar and resolves the hit
+    -- against the actors it holds -- armor, difficulty, hit chance and all, with no client
+    -- assertion in the loop. So a REAL swing here is cancel-only: puppet.lua already
+    -- returned false to stop the local ghost damage, and forwarding it as well would land
+    -- the blow twice. The relay survives for ONE caller: the test hooks (mpTest), which
+    -- keep s51/s58 policing the relay machinery itself. Degraded mode (no peer) does not
+    -- forward either -- the puppet keeps its intercept armed and the swing simply cancels
+    -- (puppet.lua MP_Detach, backlog 328); only the sim peer ever holds a cell.
+    -- Phase 4C, closed form: the peer's avatar swings and resolves EVERY melee (PvE and PvP)
+    -- natively against the actors it holds, so a real client swing is always cancel-only --
+    -- puppet.lua already returned false to stop local ghost damage; forwarding it too lands
+    -- the blow twice. This also closes the window the old hasHolder check missed: before
+    -- ActorAuthorityInfo arrived hasHolder was false and the swing forwarded AND the avatar
+    -- hit = double damage. Only the TEST hooks (mpTest) still ride the relay, keeping
+    -- s51/s58 as its regression guard; magic (onPuppetSpellHit) is unaffected -- the avatar
+    -- does not cast. Degraded mode (no peer) means no melee until the peer returns, by design.
+    if not data.mpTest then return end
+    -- Mirror for the scenarios: which address a test swing went out under, or why it did not.
+    -- ...and a running count: a page-side clear of the mirror does not stick (the value is
+    -- re-read from the engine), so a scenario that stings once and then swings for real
+    -- compares the COUNT before and after (s164).
+    local function fwd(why) hitFwdCount = hitFwdCount + 1; pcall(function() mp.set('hitFwd', why); mp.set('hitFwdCount', tostring(hitFwdCount)) end) end
     local target
     if data.playerId then
         -- Player victim. PvP off: cancel silently — the server drops these anyway, but
@@ -44,6 +68,7 @@ function combat.onPuppetHit(data)
         if not cellKey then
             -- Nothing to address the target with. Rare, and genuinely undeliverable.
             print('[mp] combat: victim has no cell, hit not forwarded')
+            fwd('no-cell')
             return
         end
         -- THE EPOCH IS OPTIONAL ON THE WIRE, AND THIS USED TO REFUSE TO SEND WITHOUT ONE.
@@ -61,7 +86,8 @@ function combat.onPuppetHit(data)
         -- nothing. Send it and let the server decide; it is the one holding the authority
         -- table, and quoting a stale epoch is the only thing it actually needs protecting from.
         local epoch = deps.epochOf(cellKey)
-        target = { ref = data.victim, cellKey = cellKey }
+        local netId = deps.netIdOf and deps.netIdOf(data.victim)
+        target = { ref = (not netId) and data.victim or nil, net = netId, cellKey = cellKey }
         if epoch then target.epoch = epoch end
     else
         return
@@ -78,6 +104,7 @@ function combat.onPuppetHit(data)
     if data.weaponId then body.weaponId = data.weaponId end
     if data.ammoId then body.ammoId = data.ammoId end
     if data.hitPos then body.hitPos = data.hitPos end
+    fwd(target.net and ('net:' .. tostring(target.net)) or (target.playerId and 'player' or 'ref'))
     mp.sendEvent('CombatHit', body)
 end
 
@@ -85,32 +112,66 @@ end
 -- rules as onPuppetHit: a player victim needs PvP on, an actor victim is addressed by cell.
 -- The server has always implemented CombatSpellHit; until now no client ever sent one.
 function combat.onPuppetSpellHit(data)
-    local function note(why) pcall(function() mp.testSet('spellFwd', why) end) end
+    local function note(why) pcall(function() mp.set('spellFwd', why) end) end
     local effects = data.effects or {}
     if #effects == 0 then note('no-effects') return end
+    local beneficial = data.beneficial == true
     local target
     if data.playerId then
-        if not deps.isPvpEnabled() then note('pvp-off') return end
+        -- PvP off stops players HARMING each other; a heal on a friend is help, and must go
+        -- through. The veto is per EFFECT (spelleffects.cpp words each hit): a record that
+        -- heals and burns loses the burn and keeps the heal. The server routes on the
+        -- whole-cast word (combat.ts spellHit), so what goes out is all-beneficial or nothing.
+        if not deps.isPvpEnabled() and not beneficial then
+            local kept = {}
+            for _, e in ipairs(effects) do if e.beneficial == true then kept[#kept + 1] = e end end
+            if #kept == 0 then note('pvp-off') return end
+            effects, beneficial = kept, true
+        end
         target = { playerId = data.playerId }
     elseif data.victim and data.victim:isValid() then
         local cellKey = deps.cellKeyOfObj(data.victim)
         if not cellKey then note('no-cell') return end
-        target = { ref = data.victim, cellKey = cellKey }
+        local netId = deps.netIdOf and deps.netIdOf(data.victim)
+        target = { ref = (not netId) and data.victim or nil, net = netId, cellKey = cellKey }
         local epoch = deps.epochOf(cellKey)
         if epoch then target.epoch = epoch end
     else
         note('no-victim')
         return
     end
+    -- WHICH effects of the record hit, when the engine named every one (an older engine names
+    -- none, and the owner then applies the whole record as before). Without this a Self+Touch
+    -- record cast at a friend gave them the caster's Fortify too (backlog 250).
+    local indexes = {}
+    for _, e in ipairs(effects) do
+        if type(e.index) ~= 'number' then indexes = nil break end
+        indexes[#indexes + 1] = e.index
+    end
     note('sending')
     mp.sendEvent('CombatSpellHit', {
         target = target,
         effects = effects,
         -- The OWNER applies the spell record by id, so this must be the spell, not the effect.
-        -- Without it MP_CombatSpellHit looks up nil and silently applies nothing.
-        spellId = data.spellId or effects[1].id,
+        -- Without it MP_CombatSpellHit looks up nil and silently applies nothing. NET id: a
+        -- spellmaker spell is a dynamic record with a different local id on every engine
+        -- (backlog 251), like the drop path's item ids.
+        spellId = worldmp.toNet(data.spellId or effects[1].id),
         casterId = deps.ownIdFn() or 0,
+        beneficial = beneficial,
+        indexes = indexes,
+        -- A reflection landing on the caster's puppet must not be reflected AGAIN by the
+        -- owner, or two Reflect-wearers volley one spell forever (backlog 254).
+        ignoreReflect = data.ignoreReflect == true,
     })
+end
+
+-- Cosmetic: the player pressed use in the spell stance (player.lua). Field names are what
+-- server/src/core/combat.ts cast() validates: spellId, casterId, kind.
+function combat.onCast(data)
+    local id = deps.ownIdFn()
+    if not id or not data.spellId then return end
+    mp.sendEvent('CombatCast', { spellId = data.spellId, casterId = id, kind = 'spell' })
 end
 
 -- --------------------------------------------------------------- inbound
@@ -143,9 +204,19 @@ end
 local function resolveVictim(data)
     local target = data.target or {}
     if target.playerId then
+        -- Phase 4B: on the SIM PEER a player victim is their AVATAR body -- the server
+        -- routes PvP hits here whenever the victim is driving the input tier, because the
+        -- victim's own stat assertions are ignored while the peer's bar reports are fresh
+        -- (4A one-writer rule): damage applied on the victim's client would silently vanish.
+        -- Applied to the avatar it lands once, and travels back as AvatarStatsBatch.
+        if mp.isSystem and mp.isSystem() then
+            local obj = deps.puppetObjOf(target.playerId)
+            return (obj and obj:isValid()) and obj or nil
+        end
         return target.playerId == deps.ownIdFn() and deps.playerFn() or nil
     end
     local obj = target.ref
+    if target.net ~= nil and deps.objOfNet then obj = deps.objOfNet(target.net) end
     if obj and obj:isValid() and deps.isHolderOf(deps.cellKeyOfObj(obj)) then
         return obj
     end
@@ -154,20 +225,19 @@ end
 
 combat.handlers = {}
 
--- Phase 4: every hit an actor takes credits the DEALER's threat, which is the only way a
--- summoner or a damage-over-time caster is visible to the AI at all — in vanilla their pet
--- does the hitting and they are ignored entirely.
-local function creditThreat(data)
-    local ref = data.ref
-    local ok, valid = pcall(function() return ref and ref:isValid() end)
-    if not (ok and valid) then return end
-    local dmg = (data.damage and data.damage.health) or 0
-    if dmg > 0 and data.byId then threat.addDamage('o:' .. ref.id, data.byId, dmg) end
-end
-
 combat.handlers.MP_CombatHit = function(data)
-    creditThreat(data)
     local victim = resolveVictim(data)
+    if mp.isSystem and mp.isSystem() then
+        local t = data.target or {}
+        -- hp and whether its scripts run (active): "resolved" alone could not tell a hit that
+        -- landed from one sent to a body whose Hit handler never runs (s120, #145).
+        local okh, hp = pcall(function() return types.Actor.stats.dynamic.health(victim).current end)
+        local oka, active = pcall(function() return victim:isValid() and victim.cell ~= nil and types.Actor.isDead(victim) end)
+        print(string.format('[mp] CombatHit on peer: net=%s ref=%s cell=%s resolved=%s hp=%s dead=%s obj=%s',
+            tostring(t.net), tostring(t.ref and t.ref.recordId), tostring(t.cellKey),
+            victim and tostring(victim.recordId) or 'NO', okh and tostring(hp) or '?',
+            oka and tostring(active) or '?', victim and tostring(victim.id) or '-'))
+    end
     if not victim then return end
     local info = attackInfoFrom(data)
     -- Re-emit the STOCK Hit event: scripts/omw/combat/interface.lua turns it into
@@ -176,19 +246,50 @@ combat.handlers.MP_CombatHit = function(data)
     -- LSER numbers arrive as doubles, so tostring() would render "40.0" — format as an
     -- integer so scenarios can compare against the value they sent.
     lastHitTaken = { health = (info.damage or {}).health or 0, by = data.attackerId }
-    mp.testSet('lastHitTaken', string.format('%.0f', lastHitTaken.health))
+    mp.set('lastHitTaken', string.format('%.0f', lastHitTaken.health))
+end
+
+-- The effect list a cast's SOURCE record applies: a spell, an enchantment, or an ITEM whose
+-- enchantment it is. A scroll or a cast-when-used ring names the item as its source
+-- (spellParams.getSourceSpellId), and activeSpells:add resolves REC_BOOK/ARMO/CLOT/WEAP
+-- through the item's enchantment the same way (mwlua/magicbindings.cpp getNameAndMagicEffects)
+-- -- so the id can be handed to add as-is; only the COUNT has to come from the enchantment.
+-- Gating on spells.records alone made every scroll and every enchanted item land nothing on
+-- a puppet or an NPC (backlog 251).
+local function sourceEffects(id)
+    local rec = core.magic.spells.records[id] or core.magic.enchantments.records[id]
+    if rec then return rec.effects end
+    for _, T in ipairs({ types.Book, types.Weapon, types.Armor, types.Clothing }) do
+        local ok, item = pcall(function() return T and T.record(id) end)
+        if ok and item and type(item.enchant) == 'string' and item.enchant ~= '' then
+            local ench = core.magic.enchantments.records[item.enchant]
+            if ench then return ench.effects end
+        end
+    end
+    return nil
 end
 
 combat.handlers.MP_CombatSpellHit = function(data)
     local victim = resolveVictim(data)
+    -- The peer's side of s59 (#432), like CombatHit's: whether the cast arrived, resolved,
+    -- and what the victim's bar did. Nothing else says so, and 14 casts in #105 said nothing.
+    if mp.isSystem and mp.isSystem() then
+        local t = data.target or {}
+        local okh, hp = pcall(function() return types.Actor.stats.dynamic.health(victim).current end)
+        print(string.format('[mp] CombatSpellHit on peer: spell=%s net=%s ref=%s cell=%s resolved=%s hp=%s',
+            tostring(data.spellId), tostring(t.net), tostring(t.ref and t.ref.recordId), tostring(t.cellKey),
+            victim and tostring(victim.recordId) or 'NO', okh and tostring(hp) or '?'))
+    end
     if not victim then return end
     -- activeSpells:add wants INDEXES into the spell record's own effect list, while the wire
-    -- carries rolled {id, magnitude, duration} triples. We therefore apply the spell record
-    -- with all of its effects and let the victim roll magnitudes locally — same spell, same
-    -- duration semantics, magnitudes re-rolled within the record's range.
+    -- carries rolled {id, magnitude, duration} triples. We therefore apply the record by the
+    -- indexes the caster's engine says hit (all of them when it named none) and let the
+    -- victim roll magnitudes locally — same spell, same duration semantics, magnitudes
+    -- re-rolled within the record's range.
     local ok, err = pcall(function()
-        local spell = core.magic.spells.records[data.spellId]
-        if not spell then return end
+        local spellId = worldmp.toLocal(data.spellId)
+        local effects = sourceEffects(spellId)
+        if not effects then return end
         -- ZERO-BASED. activeSpells:add indexes the spell record's own effect list from 0
         -- (`Actor.activeSpells(self):add({id = 'chameleon', effects = { 0 }})` in the API docs),
         -- while Lua's own list is 1-based. Building 1..n threw
@@ -196,12 +297,21 @@ combat.handlers.MP_CombatSpellHit = function(data)
         -- single application — so even a forwarded spell hit applied nothing. Never caught
         -- because no client had ever sent a CombatSpellHit for this to receive.
         local indexes = {}
-        for i = 1, #spell.effects do indexes[i] = i - 1 end
+        if type(data.indexes) == 'table' and #data.indexes > 0 then
+            for _, i in ipairs(data.indexes) do
+                if type(i) == 'number' and i >= 0 and i < #effects then indexes[#indexes + 1] = i end
+            end
+        else
+            for i = 1, #effects do indexes[i] = i - 1 end
+        end
+        if #indexes == 0 then return end
         types.Actor.activeSpells(victim):add({
-            id = data.spellId,
+            id = spellId,
             effects = indexes,
             caster = deps.puppetObjOf(data.attackerId),
             ignoreResistances = false,
+            -- Already a reflection: the caster's copy bounced it once (backlog 254).
+            ignoreReflect = data.ignoreReflect == true,
         })
     end)
     if not ok then print('[mp] combat: spell apply failed: ' .. tostring(err)) end
